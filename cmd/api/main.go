@@ -330,6 +330,11 @@ func run() error {
 		if os.Getenv("CUSTOM_DOMAIN_ASK_TOKEN") == "" {
 			return errors.New("CUSTOM_DOMAIN_ASK_TOKEN is required when APP_ENV=production (use a long random value, for example: openssl rand -hex 32)")
 		}
+		if tok, proj := os.Getenv("VERCEL_API_TOKEN"), os.Getenv("VERCEL_PROJECT_ID"); tok != "" && proj != "" {
+			customDomainSvc.SetAttacher(customdomain.NewVercelAttacher(tok, proj, os.Getenv("VERCEL_TEAM_ID")))
+		} else if cfg.IsProduction() {
+			log.Warn("custom domains: VERCEL_API_TOKEN / VERCEL_PROJECT_ID not set, verified domains will not be added to Vercel")
+		}
 	}
 
 	// Sign-up email verification: a code is emailed first, and registration

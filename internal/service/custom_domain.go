@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"log/slog"
 	"net"
 	"net/url"
 	"strings"
@@ -107,7 +108,8 @@ type CustomDomainService struct {
 	now     func() time.Time
 
 	mu    sync.RWMutex
-	gate  CustomDomainGate // nil = no plan checks
+	gate  CustomDomainGate      // nil = no plan checks
+	host  customdomain.Attacher // tells the frontend host (Vercel) about verified domains
 	cache map[string]cdCacheEntry
 }
 
@@ -116,6 +118,7 @@ func NewCustomDomainService(repo repository.CustomDomainRepository, slugs custom
 		repo: repo, slugs: slugs, checker: checker, cfg: cfg,
 		now:   func() time.Time { return time.Now().UTC() },
 		cache: make(map[string]cdCacheEntry),
+		host:  customdomain.NoopAttacher{},
 	}
 }
 
@@ -124,6 +127,49 @@ func (s *CustomDomainService) SetGate(g CustomDomainGate) {
 	s.mu.Lock()
 	s.gate = g
 	s.mu.Unlock()
+}
+
+// SetAttacher sets what is told about a domain once it is verified (and when it
+// is removed). Without it nothing is told, which is right for local testing.
+func (s *CustomDomainService) SetAttacher(a customdomain.Attacher) {
+	if a == nil {
+		a = customdomain.NoopAttacher{}
+	}
+	s.mu.Lock()
+	s.host = a
+	s.mu.Unlock()
+}
+
+func (s *CustomDomainService) attacher() customdomain.Attacher {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.host
+}
+
+// attach registers a verified domain with the frontend host. Attaching is safe
+// to repeat. A root domain also gets its www name, best effort, because the
+// frontend redirects www to the root domain.
+func (s *CustomDomainService) attach(ctx context.Context, domain string) error {
+	h := s.attacher()
+	if err := h.Attach(ctx, domain); err != nil {
+		return err
+	}
+	if customdomain.IsApex(domain) {
+		_ = h.Attach(ctx, "www."+domain)
+	}
+	return nil
+}
+
+// detach is best effort: the seller's change must not fail because the
+// frontend host was unreachable.
+func (s *CustomDomainService) detach(ctx context.Context, domain string) {
+	h := s.attacher()
+	if err := h.Detach(ctx, domain); err != nil {
+		slog.Warn("custom domain: could not detach domain", "domain", domain, "error", err.Error())
+	}
+	if customdomain.IsApex(domain) {
+		_ = h.Detach(ctx, "www."+domain)
+	}
 }
 
 func (s *CustomDomainService) requirePlan(ctx context.Context, sellerID string) error {
@@ -190,6 +236,7 @@ func (s *CustomDomainService) Set(ctx context.Context, sellerID, input string) (
 	}
 	if old != nil {
 		s.forget(old.Domain)
+		s.detach(ctx, old.Domain)
 	}
 	s.forget(domain)
 	return s.view(ctx, sellerID, d), nil
@@ -232,9 +279,22 @@ func (s *CustomDomainService) Verify(ctx context.Context, sellerID string) (Cust
 	d.LastCheckedAt = &now
 	d.UpdatedAt = now
 	d.DNSOK = res.Routed
+	// Once ownership is proven, make sure the frontend host serves the domain.
+	// This also runs for an already verified domain, so a failed attach
+	// repairs itself the next time the seller presses Check DNS.
+	attachFailed := false
+	if d.Status == models.DomainVerified || res.Owned {
+		if err := s.attach(ctx, d.Domain); err != nil {
+			attachFailed = true
+			slog.Error("custom domain: could not attach domain to the frontend host", "domain", d.Domain, "error", err.Error())
+		}
+	}
 	switch {
 	case d.Status == models.DomainVerified:
 		d.LastError = "" // ownership was proven once; the TXT record is no longer needed
+	case res.Owned && attachFailed:
+		// Stay pending so the next check tries again.
+		d.LastError = "Your domain is verified, but we could not connect it to your store yet. Press Check DNS again in a minute."
 	case res.Owned:
 		d.Status = models.DomainVerified
 		d.VerifiedAt = &now
@@ -265,6 +325,7 @@ func (s *CustomDomainService) Remove(ctx context.Context, sellerID string) error
 		return err
 	}
 	s.forget(old.Domain)
+	s.detach(ctx, old.Domain)
 	return nil
 }
 

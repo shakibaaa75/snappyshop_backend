@@ -15,6 +15,8 @@ var twoLevelSuffixes = map[string]bool{
 	"co.uk": true, "org.uk": true, "com.au": true, "co.in": true,
 	"com.pk": true, "co.nz": true, "com.sg": true, "com.my": true,
 	"co.za": true, "com.br": true,
+	// Free domain providers: mystore.dpdns.org is a root domain here too.
+	"dpdns.org": true, "qzz.io": true, "us.kg": true, "xx.kg": true,
 }
 
 // IsApex reports whether domain is a root domain such as mystore.com or
