@@ -2,6 +2,8 @@
 package handler
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
@@ -19,6 +22,28 @@ type ProductHandler struct {
 	Svc         *service.ProductService
 	StoreDesign *service.StoreDesignService
 	Log         *slog.Logger
+
+	// Cache is the shared read-through cache (Redis). Nil means the public
+	// product list always reads MongoDB, exactly as before.
+	Cache *cache.Cache
+}
+
+// storefrontSellerTag is the cache version tag for everything public that
+// belongs to one seller. Bumping it drops that seller's cached product list on
+// every API instance at once.
+func storefrontSellerTag(sellerID string) string { return "seller:" + sellerID }
+
+// invalidateSellerStorefront drops one seller's cached public data. It is
+// called after a product is created, changed or deleted, and after an order
+// changed stock. Failures are logged and retried in the background by the
+// cache, so callers ignore the result.
+func invalidateSellerStorefront(c *cache.Cache, sellerID string) {
+	if c == nil || sellerID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = c.Invalidate(ctx, storefrontSellerTag(sellerID))
 }
 
 // ---------- DTO types ----------
@@ -382,6 +407,7 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	invalidateSellerStorefront(h.Cache, claims.UserID)
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"product": toProductDTO(p)})
 }
 
@@ -403,6 +429,7 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	invalidateSellerStorefront(h.Cache, claims.UserID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"product": toProductDTO(p)})
 }
 
@@ -418,10 +445,17 @@ func (h *ProductHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	invalidateSellerStorefront(h.Cache, claims.UserID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // PublicList — GET /api/v1/store/{slug}/products (public, no auth)
+//
+// The slug is always resolved against MongoDB first (one indexed lookup), so a
+// retired or unpublished store URL answers 404 at once, never from the cache.
+// Only the expensive part, the product list of that seller, is cached. The
+// list is the same for every visitor, so sharing it cannot leak per-user data.
+// Checkout never uses it: orders read prices and stock from MongoDB.
 func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	if slug == "" {
@@ -437,14 +471,49 @@ func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.NotFound())
 		return
 	}
-	items, err := h.Svc.ListPublic(r.Context(), sellerID)
+	out, err := h.publicProducts(r.Context(), sellerID)
 	if err != nil {
+		if errors.Is(err, cache.ErrBusy) {
+			// Too many concurrent loads on this instance: shed load instead
+			// of queueing database work.
+			w.Header().Set("Retry-After", "2")
+			h.fail(w, r, apperr.New(http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
+				"The store is busy. Please try again shortly."))
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
-	out := make([]ProductDTO, 0, len(items))
-	for _, p := range items {
-		out = append(out, toProductDTO(p))
-	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"products": out})
+}
+
+// publicProducts returns the public product DTOs of one seller, through the
+// shared cache when it is configured.
+func (h *ProductHandler) publicProducts(ctx context.Context, sellerID string) ([]ProductDTO, error) {
+	load := func(ctx context.Context) ([]ProductDTO, error) {
+		items, err := h.Svc.ListPublic(ctx, sellerID)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]ProductDTO, 0, len(items))
+		for _, p := range items {
+			out = append(out, toProductDTO(p))
+		}
+		return out, nil
+	}
+	if h.Cache == nil {
+		return load(ctx)
+	}
+	key, kerr := cache.ScopedKey(sellerID, "public-products")
+	if kerr != nil {
+		return load(ctx) // unusual seller id: skip the cache, never fail
+	}
+	out, err := cache.Get(ctx, h.Cache, "product", key, storefrontSellerTag(sellerID), load)
+	if err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []ProductDTO{} // keep "products": [] and never null
+	}
+	return out, nil
 }

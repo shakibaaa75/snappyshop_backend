@@ -198,13 +198,15 @@ func New(d Deps) http.Handler {
 	refreshLimit := authLimit("refresh", limits.Refresh)
 	forgotLimit := authLimit("forgot", limits.ForgotPassword)
 	resetLimit := authLimit("reset", limits.ResetPassword)
-	orderCreateLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.CreateOrder.Every, limits.CreateOrder.Burst), cfg.TrustProxy, log)
-	checkoutLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.Checkout.Every, limits.Checkout.Burst), cfg.TrustProxy, log)
+	// Order creation and checkout are shared across API instances too (Redis);
+	// without a RateGuard they keep the per-process limiters.
+	orderCreateLimit := authLimit("order-create", limits.CreateOrder)
+	checkoutLimit := authLimit("checkout", limits.Checkout)
 
 	sd := &handler.StoreDesignHandler{Svc: d.StoreDesign, Log: log}
-	prod := &handler.ProductHandler{Svc: d.Products, StoreDesign: d.StoreDesign, Log: log}
+	prod := &handler.ProductHandler{Svc: d.Products, StoreDesign: d.StoreDesign, Log: log, Cache: d.Cache}
 	cat := &handler.CategoryHandler{Svc: d.Categories, StoreDesign: d.StoreDesign, Log: log}
-	order := &handler.OrderHandler{Svc: d.Orders, Analytics: d.Analytics, TrustProxy: cfg.TrustProxy, Log: log}
+	order := &handler.OrderHandler{Svc: d.Orders, Analytics: d.Analytics, TrustProxy: cfg.TrustProxy, Log: log, Cache: d.Cache}
 	stats := &handler.StatsHandler{Svc: d.Orders, Log: log}
 	reset := &handler.PasswordResetHandler{Svc: d.PasswordReset, Log: log, Limiter: d.ResetLimiter, Guard: d.RateGuard, TrustProxy: cfg.TrustProxy}
 

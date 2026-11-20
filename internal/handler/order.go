@@ -10,6 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
@@ -24,6 +25,10 @@ type OrderHandler struct {
 	Analytics *service.AnalyticsService
 	// TrustProxy must match cfg.TrustProxy (used for the client IP).
 	TrustProxy bool
+	// Cache is the shared cache (Redis). When set, a placed order drops the
+	// seller's cached public product list, so stock shown on the storefront
+	// follows the order at once. Nil = nothing to invalidate.
+	Cache *cache.Cache
 }
 
 /* ------------------------------------------------------------------ */
@@ -227,6 +232,8 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.trackPurchase(r, order.SellerID, order.ID, order.Total, body.Source, body.VisitorID)
+	// Stock changed: the cached public product list is out of date.
+	invalidateSellerStorefront(h.Cache, order.SellerID)
 	// FIX: return the full order (same shape the seller endpoints use) so the
 	// confirmation page has lines, status, customer details, etc. The original
 	// five fields (id, number, subtotal, delivery, total) are all still here.
