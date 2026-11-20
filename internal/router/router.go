@@ -137,6 +137,10 @@ func New(d Deps) http.Handler {
 		return ""
 	}))
 	r.Use(middleware.Recoverer(log))
+	// Gzip for JSON answers: the storefront and marketplace lists are 100 KB to
+	// 2 MB of JSON, which compresses about ten times. Only when the client sends
+	// Accept-Encoding: gzip.
+	r.Use(chimw.Compress(5, "application/json"))
 	r.Use(middleware.SecurityHeaders(cfg.CookieSecure))
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   cfg.CORSOrigins,
@@ -203,7 +207,7 @@ func New(d Deps) http.Handler {
 	orderCreateLimit := authLimit("order-create", limits.CreateOrder)
 	checkoutLimit := authLimit("checkout", limits.Checkout)
 
-	sd := &handler.StoreDesignHandler{Svc: d.StoreDesign, Log: log}
+	sd := &handler.StoreDesignHandler{Svc: d.StoreDesign, Log: log, Cache: d.Cache}
 	prod := &handler.ProductHandler{Svc: d.Products, StoreDesign: d.StoreDesign, Log: log, Cache: d.Cache}
 	cat := &handler.CategoryHandler{Svc: d.Categories, StoreDesign: d.StoreDesign, Log: log}
 	order := &handler.OrderHandler{Svc: d.Orders, Analytics: d.Analytics, TrustProxy: cfg.TrustProxy, Log: log, Cache: d.Cache}
@@ -370,17 +374,24 @@ func New(d Deps) http.Handler {
 		})
 
 		if d.Mongo != nil {
-			mk := &handler.MarketplaceHandler{DB: d.Mongo, Log: log, Tax: taxIndex, Cache: d.Cache}
+			mk := &handler.MarketplaceHandler{DB: d.Mongo, Log: log, Tax: taxIndex, Cache: d.Cache, ServeStale: true}
 			// A renamed shop must disappear under its old name/URL at once,
 			// not when the marketplace snapshot expires.
 			if d.StoreDesign != nil {
-				d.StoreDesign.SetOnIdentityChange(mk.InvalidateSnapshot)
+				d.StoreDesign.SetOnIdentityChange(func() {
+					mk.InvalidateSnapshot()
+					sd.InvalidateIdentity() // old URL must 404 at once
+				})
 			}
 			// Suspending / banning / restoring a seller must show up on the
 			// marketplace at once as well.
 			if d.Admin != nil {
-				d.Admin.SetOnVisibilityChange(mk.InvalidateSnapshot)
+				d.Admin.SetOnVisibilityChange(func() {
+					mk.InvalidateSnapshot()
+					sd.InvalidateIdentity()
+				})
 			}
+			go mk.Warm() // build the snapshot now, not on the first visit
 			api.With(publicReadLimit).Get("/marketplace/products", mk.Products)
 			api.With(publicReadLimit).Get("/marketplace/sellers", mk.Sellers)
 			api.With(publicReadLimit).Get("/marketplace/categories", mk.Categories)

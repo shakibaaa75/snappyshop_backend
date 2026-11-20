@@ -1,13 +1,17 @@
 package handler
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/service"
@@ -16,7 +20,16 @@ import (
 type StoreDesignHandler struct {
 	Svc *service.StoreDesignService
 	Log *slog.Logger
+
+	// Cache is the shared cache (Redis). Nil = every public request reads
+	// MongoDB, exactly as before.
+	Cache *cache.Cache
 }
+
+// InvalidateIdentity drops the cached slug lookups and public store designs on
+// every API instance. The router calls it when a shop name/URL changes or an
+// admin changes a seller's visibility.
+func (h *StoreDesignHandler) InvalidateIdentity() { invalidateSlugs(h.Cache) }
 
 type designBody struct {
 	Design map[string]any `json:"design"`
@@ -123,6 +136,7 @@ func (h *StoreDesignHandler) Publish(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	invalidateSlugs(h.Cache) // the public design (and a first publish) changed
 	res, err := h.Svc.GetDraftWithMeta(r.Context(), claims.UserID)
 	if err != nil {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "published"})
@@ -190,10 +204,20 @@ func (h *StoreDesignHandler) ChangeName(w http.ResponseWriter, r *http.Request) 
 }
 
 // PublicStore — GET /api/v1/store/:slug (no auth)
+//
+// The published design is the same for every visitor, so it is shared through
+// the cache. A shop name/URL change, a publish and an admin visibility change
+// all invalidate slugsTag, so a retired URL answers 404 at once.
 func (h *StoreDesignHandler) PublicStore(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
-	design, err := h.Svc.PublicStore(r.Context(), slug)
+	design, err := h.publicDesign(r.Context(), slug)
 	if err != nil {
+		if errors.Is(err, cache.ErrBusy) {
+			w.Header().Set("Retry-After", "2")
+			h.fail(w, r, apperr.New(http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
+				"The store is busy. Please try again shortly."))
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
@@ -202,4 +226,39 @@ func (h *StoreDesignHandler) PublicStore(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, designResponse{Design: design})
+}
+
+// publicDesign returns the published design for a slug, or nil when unknown.
+func (h *StoreDesignHandler) publicDesign(ctx context.Context, slug string) (map[string]any, error) {
+	load := func(ctx context.Context) (map[string]any, error) {
+		d, err := h.Svc.PublicStore(ctx, slug)
+		if err != nil {
+			return nil, err
+		}
+		if d == nil {
+			return nil, cache.ErrNotFound
+		}
+		return d, nil
+	}
+	direct := func() (map[string]any, error) {
+		d, err := load(ctx)
+		if errors.Is(err, cache.ErrNotFound) {
+			return nil, nil
+		}
+		return d, err
+	}
+	key := strings.ToLower(strings.TrimSpace(slug))
+	if h.Cache == nil || key == "" {
+		return direct()
+	}
+	d, err := cache.Get(ctx, h.Cache, "storefront", "design:"+key, slugsTag, load)
+	switch {
+	case err == nil:
+		return d, nil
+	case errors.Is(err, cache.ErrNotFound):
+		return nil, nil
+	case errors.Is(err, cache.ErrInvalidKey):
+		return direct()
+	}
+	return nil, err
 }

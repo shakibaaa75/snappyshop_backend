@@ -51,6 +51,15 @@ type MarketplaceHandler struct {
 	lastShared   string        // last shared version read ("" = unknown)
 	verCheckedAt time.Time     // when it was read
 	verInterval  time.Duration // test seam; 0 = defaultVersionCheck
+
+	// ServeStale: when the snapshot is only expired by age, answer with the
+	// old copy at once and rebuild in the background, so no visitor waits for
+	// the database. An invalidation (shop rename, suspension) still rebuilds
+	// before answering. False (the default) = rebuild before answering.
+	ServeStale bool
+	refreshing bool      // a background rebuild is running
+	gen        uint64    // bumped by InvalidateSnapshot; drops in-flight rebuilds
+	retryAt    time.Time // no background rebuild before this time (after a failure)
 }
 
 const marketplaceTimeout = 8 * time.Second

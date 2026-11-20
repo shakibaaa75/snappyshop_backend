@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"shopbd/backend/internal/models"
 )
 
@@ -24,6 +26,10 @@ const defaultVersionCheck = time.Second
 // window.
 const marketSnapshotTTL = 30 * time.Second
 
+// marketSnapshotMaxStale bounds ServeStale: an older snapshot is rebuilt
+// before answering.
+const marketSnapshotMaxStale = 10 * time.Minute
+
 // marketSnapshot is a read-only view of everything the marketplace endpoints
 // need. Handlers MUST NOT mutate the maps or slices inside it.
 type marketSnapshot struct {
@@ -40,28 +46,45 @@ type marketSnapshot struct {
 // buildSnapshot loads the snapshot from MongoDB using the same queries the
 // handlers previously ran on every request.
 func (h *MarketplaceHandler) buildSnapshot(ctx context.Context) (*marketSnapshot, error) {
-	stores, err := h.stores(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]string, 0, len(stores))
-	for id := range stores {
-		ids = append(ids, id)
-	}
-	prods, err := h.products(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	cats, err := h.categoriesByID(ctx)
-	if err != nil {
-		return nil, err
-	}
-	sold, err := h.soldByProduct(ctx)
-	if err != nil {
-		return nil, err
-	}
-	completed, err := h.deliveredBySeller(ctx)
-	if err != nil {
+	// The queries are independent except products (which need the store ids),
+	// so they run in parallel: the build takes about two database round trips
+	// instead of five or six in a row.
+	var (
+		stores    map[string]*storeInfo
+		prods     []*models.Product
+		cats      map[string]*models.Category
+		sold      map[string]int
+		completed map[string]int
+	)
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		var err error
+		if stores, err = h.stores(gctx); err != nil {
+			return err
+		}
+		ids := make([]string, 0, len(stores))
+		for id := range stores {
+			ids = append(ids, id)
+		}
+		prods, err = h.products(gctx, ids)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		cats, err = h.categoriesByID(gctx)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		sold, err = h.soldByProduct(gctx)
+		return err
+	})
+	g.Go(func() error {
+		var err error
+		completed, err = h.deliveredBySeller(gctx)
+		return err
+	})
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
 	counts := make(map[string]int, len(stores))
@@ -79,6 +102,10 @@ func (h *MarketplaceHandler) buildSnapshot(ctx context.Context) (*marketSnapshot
 		builtAt:   time.Now(),
 	}, nil
 }
+
+// Warm builds the snapshot once, so the first visitor after a start does not
+// wait for it. Call it in a goroutine at startup.
+func (h *MarketplaceHandler) Warm() { _, _ = h.snapshot() }
 
 // snapshot returns the cached snapshot, rebuilding it when older than the TTL
 // or when another instance invalidated the marketplace (shared version tag).
@@ -98,8 +125,17 @@ func (h *MarketplaceHandler) snapshot() (*marketSnapshot, error) {
 	defer h.mu.Unlock()
 
 	shared := h.sharedVersion()
-	if h.snap != nil && time.Since(h.snap.builtAt) < marketSnapshotTTL && (shared == "" || shared == h.snapVer) {
-		return h.snap, nil
+	if h.snap != nil && (shared == "" || shared == h.snapVer) {
+		age := time.Since(h.snap.builtAt)
+		if age < marketSnapshotTTL {
+			return h.snap, nil
+		}
+		// Expired by age only, nobody invalidated it: with ServeStale the
+		// visitor gets the old copy now and a fresh one is built behind it.
+		if h.ServeStale && age < marketSnapshotMaxStale {
+			h.refreshInBackground(shared)
+			return h.snap, nil
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), marketplaceTimeout)
@@ -122,6 +158,43 @@ func (h *MarketplaceHandler) snapshot() (*marketSnapshot, error) {
 	h.snap = snap
 	h.snapVer = shared
 	return snap, nil
+}
+
+// refreshInBackground rebuilds the snapshot without blocking the caller. It is
+// called with h.mu held. One rebuild runs at a time; after a failure the next
+// attempt waits 5 seconds. A rebuild that finishes after an invalidation, or
+// that is older than what is already stored, is dropped.
+func (h *MarketplaceHandler) refreshInBackground(shared string) {
+	if h.refreshing || time.Now().Before(h.retryAt) {
+		return
+	}
+	h.refreshing = true
+	gen := h.gen
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), marketplaceTimeout)
+		defer cancel()
+		build := h.build
+		if build == nil {
+			build = h.buildSnapshot
+		}
+		snap, err := build(ctx)
+
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.refreshing = false
+		if err != nil {
+			h.retryAt = time.Now().Add(5 * time.Second)
+			if h.Log != nil {
+				h.Log.Warn("marketplace snapshot background rebuild failed; serving stale data", "error", err.Error())
+			}
+			return
+		}
+		if h.gen != gen || (h.snap != nil && !snap.builtAt.After(h.snap.builtAt)) {
+			return
+		}
+		h.snap = snap
+		h.snapVer = shared
+	}()
 }
 
 // sharedVersion returns the fleet-wide marketplace version, or "" when it is
@@ -157,6 +230,7 @@ func (h *MarketplaceHandler) sharedVersion() string {
 func (h *MarketplaceHandler) InvalidateSnapshot() {
 	h.mu.Lock()
 	h.snap = nil
+	h.gen++
 	h.verCheckedAt = time.Time{}
 	h.mu.Unlock()
 	if h.Cache != nil {

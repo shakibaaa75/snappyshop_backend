@@ -451,9 +451,11 @@ func (h *ProductHandler) Delete(w http.ResponseWriter, r *http.Request) {
 
 // PublicList — GET /api/v1/store/{slug}/products (public, no auth)
 //
-// The slug is always resolved against MongoDB first (one indexed lookup), so a
-// retired or unpublished store URL answers 404 at once, never from the cache.
-// Only the expensive part, the product list of that seller, is cached. The
+// The slug is resolved through the shared cache (tag "slugs", invalidated on
+// every shop name/URL change, publish and visibility change), so a retired or
+// unpublished store URL answers 404 at once on every instance. The product list
+// of that seller is cached under its own tag. Both are the same for every
+// visitor, so sharing them cannot leak per-user data. The
 // list is the same for every visitor, so sharing it cannot leak per-user data.
 // Checkout never uses it: orders read prices and stock from MongoDB.
 func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
@@ -462,8 +464,14 @@ func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.BadRequest("Missing slug"))
 		return
 	}
-	sellerID, err := h.StoreDesign.SellerIDBySlug(r.Context(), slug)
+	sellerID, err := cachedSellerID(r.Context(), h.Cache, h.StoreDesign, slug)
 	if err != nil {
+		if errors.Is(err, cache.ErrBusy) {
+			w.Header().Set("Retry-After", "2")
+			h.fail(w, r, apperr.New(http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE",
+				"The store is busy. Please try again shortly."))
+			return
+		}
 		h.fail(w, r, err)
 		return
 	}
