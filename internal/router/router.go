@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/config"
 	"shopbd/backend/internal/courierconn"
 	"shopbd/backend/internal/handler"
@@ -82,7 +83,9 @@ type Deps struct {
 	Categories         *service.CategoryService
 	Orders             *service.OrderService
 	PasswordReset      *service.PasswordResetService
-	ResetLimiter       ratelimit.Limiter // shared (Redis) limiter for password reset; nil = per-process limits only
+	ResetLimiter       ratelimit.Limiter // legacy fixed-window limiter for password reset; ignored when RateGuard is set
+	RateGuard          *ratelimit.Guard  // shared token buckets (Redis) for auth endpoints; nil = per-process limits only
+	Cache              *cache.Cache      // shared cache (Redis); nil = in-process caching only
 	EmailVerification  *service.EmailVerificationService
 	Analytics          *service.AnalyticsService
 	Tracking           *service.TrackingService     // nil = pixel settings switched off
@@ -168,18 +171,33 @@ func New(d Deps) http.Handler {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
+	// Auth endpoints use token buckets shared by all API instances when a
+	// RateGuard (Redis) is configured; otherwise the per-process limiters run
+	// exactly as before. Routes that share a name share one bucket per client,
+	// as they shared one limiter before.
+	authLimit := func(name string, s LimitSpec) func(http.Handler) http.Handler {
+		if d.RateGuard != nil {
+			return middleware.SharedRateLimit(d.RateGuard, name, ratelimit.Spec{Capacity: s.Burst, Every: s.Every}, cfg.TrustProxy, log)
+		}
+		return middleware.RateLimit(middleware.NewKeyedLimiter(s.Every, s.Burst), cfg.TrustProxy, log)
+	}
+	var emailLimiter handler.KeyLimiter = middleware.NewKeyedLimiter(limits.LoginEmail.Every, limits.LoginEmail.Burst)
+	if d.RateGuard != nil {
+		emailLimiter = &ratelimit.KeyedAllow{Guard: d.RateGuard, Name: "login-email",
+			Spec: ratelimit.Spec{Capacity: limits.LoginEmail.Burst, Every: limits.LoginEmail.Every}}
+	}
 	auth := &handler.AuthHandler{
 		Svc:          d.Auth,
 		StoreDesign:  d.StoreDesign,
 		Cookies:      httpx.CookieSettings{Secure: cfg.CookieSecure, Domain: cfg.CookieDomain},
-		EmailLimiter: middleware.NewKeyedLimiter(limits.LoginEmail.Every, limits.LoginEmail.Burst),
+		EmailLimiter: emailLimiter,
 		Log:          log,
 	}
-	registerLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.Register.Every, limits.Register.Burst), cfg.TrustProxy, log)
-	loginLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.Login.Every, limits.Login.Burst), cfg.TrustProxy, log)
-	refreshLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.Refresh.Every, limits.Refresh.Burst), cfg.TrustProxy, log)
-	forgotLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.ForgotPassword.Every, limits.ForgotPassword.Burst), cfg.TrustProxy, log)
-	resetLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.ResetPassword.Every, limits.ResetPassword.Burst), cfg.TrustProxy, log)
+	registerLimit := authLimit("register", limits.Register)
+	loginLimit := authLimit("login", limits.Login)
+	refreshLimit := authLimit("refresh", limits.Refresh)
+	forgotLimit := authLimit("forgot", limits.ForgotPassword)
+	resetLimit := authLimit("reset", limits.ResetPassword)
 	orderCreateLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.CreateOrder.Every, limits.CreateOrder.Burst), cfg.TrustProxy, log)
 	checkoutLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.Checkout.Every, limits.Checkout.Burst), cfg.TrustProxy, log)
 
@@ -188,7 +206,7 @@ func New(d Deps) http.Handler {
 	cat := &handler.CategoryHandler{Svc: d.Categories, StoreDesign: d.StoreDesign, Log: log}
 	order := &handler.OrderHandler{Svc: d.Orders, Analytics: d.Analytics, TrustProxy: cfg.TrustProxy, Log: log}
 	stats := &handler.StatsHandler{Svc: d.Orders, Log: log}
-	reset := &handler.PasswordResetHandler{Svc: d.PasswordReset, Log: log, Limiter: d.ResetLimiter, TrustProxy: cfg.TrustProxy}
+	reset := &handler.PasswordResetHandler{Svc: d.PasswordReset, Log: log, Limiter: d.ResetLimiter, Guard: d.RateGuard, TrustProxy: cfg.TrustProxy}
 
 	// Platform-wide category tree (Fashion -> Hoodie ...), stored in MongoDB
 	// and seeded on first run. The Catalog (second value) is used by the admin
@@ -319,6 +337,8 @@ func New(d Deps) http.Handler {
 			a.With(refreshLimit).Post("/refresh", auth.Refresh)
 			a.Post("/logout", auth.Logout)
 			a.With(middleware.Authenticate(d.Auth, log)).Get("/me", auth.Me)
+			// A signed-in buyer becomes a seller (same account, needs shop name + address).
+			a.With(loginLimit, middleware.Authenticate(d.Auth, log)).Post("/become-seller", auth.BecomeSeller)
 
 			a.With(forgotLimit).Post("/forgot-password", reset.ForgotPassword)
 			a.With(resetLimit).Post("/reset-password", reset.ResetPassword)
@@ -348,7 +368,7 @@ func New(d Deps) http.Handler {
 		})
 
 		if d.Mongo != nil {
-			mk := &handler.MarketplaceHandler{DB: d.Mongo, Log: log, Tax: taxIndex}
+			mk := &handler.MarketplaceHandler{DB: d.Mongo, Log: log, Tax: taxIndex, Cache: d.Cache}
 			// A renamed shop must disappear under its old name/URL at once,
 			// not when the marketplace snapshot expires.
 			if d.StoreDesign != nil {

@@ -119,3 +119,58 @@ func TestOriginsAreNormalized(t *testing.T) {
 		t.Errorf("got %v want %v", c.CORSOrigins, want)
 	}
 }
+
+func TestRedisCacheAndRateLimitDefaults(t *testing.T) {
+	env := validEnv()
+	env["REDIS_URL"] = "redis://localhost:6379"
+	c, err := FromLookup(lookupFrom(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RedisRateLimitURL != env["REDIS_URL"] || c.RedisCacheURL != env["REDIS_URL"] {
+		t.Errorf("both purposes should default to REDIS_URL: %q %q", c.RedisRateLimitURL, c.RedisCacheURL)
+	}
+	if c.RateLimitFailClosed || c.RateLimitLocalDiv != 3 {
+		t.Errorf("rate limit defaults wrong: closed=%v div=%d", c.RateLimitFailClosed, c.RateLimitLocalDiv)
+	}
+	if !c.CacheEnabled || c.CacheMaxDBLoads != 16 || c.CacheLockTTL <= c.CacheLoadTimeout {
+		t.Errorf("cache defaults wrong: %+v", c)
+	}
+}
+
+func TestRedisSeparateURLsAndOverrides(t *testing.T) {
+	env := validEnv()
+	env["RATELIMIT_REDIS_URL"] = "rediss://rl.example:6380"
+	env["CACHE_REDIS_URL"] = "redis://cache.example:6379"
+	env["CACHE_PUBLIC_TTL"] = "2m"
+	env["CACHE_TTL_JITTER"] = "0.2"
+	env["RATELIMIT_FAIL_CLOSED"] = "true"
+	c, err := FromLookup(lookupFrom(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RedisRateLimitURL == c.RedisCacheURL || c.CachePublicTTL != 2*time.Minute || c.CacheJitterPct != 0.2 || !c.RateLimitFailClosed {
+		t.Errorf("overrides not applied: %+v", c)
+	}
+}
+
+func TestRedisTuningRejectsBadValues(t *testing.T) {
+	for k, v := range map[string]string{
+		"CACHE_REDIS_URL":     "http://not-redis",
+		"CACHE_TTL_JITTER":    "0.9",
+		"CACHE_LOCK_TTL":      "1s", // must exceed CACHE_LOAD_TIMEOUT (5s default)
+		"REDIS_POOL_SIZE":     "0",
+		"CACHE_MAX_DB_LOADS":  "abc",
+		"REDIS_OP_TIMEOUT":    "1ns",
+		"CACHE_ENABLED":       "maybe",
+		"CACHE_MAX_WAITERS":   "1",
+		"CACHE_PUBLIC_TTL":    "0s",
+		"RATELIMIT_REDIS_URL": "localhost:6379",
+	} {
+		env := validEnv()
+		env[k] = v
+		if _, err := FromLookup(lookupFrom(env)); err == nil {
+			t.Errorf("%s=%q should be rejected", k, v)
+		}
+	}
+}

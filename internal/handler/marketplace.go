@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/database"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/models"
@@ -42,6 +43,14 @@ type MarketplaceHandler struct {
 	mu    sync.Mutex
 	snap  *marketSnapshot
 	build func(context.Context) (*marketSnapshot, error) // test seam; nil = MongoDB
+
+	// Cache, when set, shares invalidations between API instances (version tag
+	// in Redis). Nil = invalidation only affects this instance, as before.
+	Cache        *cache.Cache
+	snapVer      string        // shared version the current snapshot was built under
+	lastShared   string        // last shared version read ("" = unknown)
+	verCheckedAt time.Time     // when it was read
+	verInterval  time.Duration // test seam; 0 = defaultVersionCheck
 }
 
 const marketplaceTimeout = 8 * time.Second

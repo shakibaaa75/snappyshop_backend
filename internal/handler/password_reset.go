@@ -35,7 +35,11 @@ type PasswordResetHandler struct {
 
 	// Limiter is shared between instances (Redis). Nil means only the
 	// per-process limiter in the router applies.
-	Limiter    ratelimit.Limiter
+	Limiter ratelimit.Limiter
+
+	// Guard, when set, replaces Limiter with token buckets shared through
+	// Redis plus a strict local fallback (and optional fail-closed policy).
+	Guard      *ratelimit.Guard
 	TrustProxy bool
 }
 
@@ -55,13 +59,18 @@ func (h *PasswordResetHandler) fail(w http.ResponseWriter, r *http.Request, err 
 
 // allow counts the request against an IP limit and an email limit. The email
 // key is derived from what the caller typed, never from whether an account
-// exists, so a refusal says nothing about the account. If Redis cannot be
-// reached it lets the request through and logs: the service's per-code attempt
-// cap still protects every code, and a Redis outage must not lock people out.
+// exists, so a refusal says nothing about the account.
+//
+// With a Guard, each limit is a token bucket (capacity = limit, one token back
+// every window/limit). If Redis is down the Guard applies a strict local limit
+// or refuses (unavailable=true) under the fail-closed policy; it never just
+// lets traffic through. Without a Guard the older fixed-window Limiter runs and
+// lets requests through when Redis errors (the service's per-code attempt cap
+// still protects every code).
 func (h *PasswordResetHandler) allow(r *http.Request, action, email string,
-	ipLimit int, ipWindow time.Duration, emailLimit int, emailWindow time.Duration) (bool, time.Duration) {
-	if h.Limiter == nil {
-		return true, 0
+	ipLimit int, ipWindow time.Duration, emailLimit int, emailWindow time.Duration) (ok bool, wait time.Duration, unavailable bool) {
+	if h.Guard == nil && h.Limiter == nil {
+		return true, 0, false
 	}
 	sum := sha256.Sum256([]byte(validation.NormalizeEmail(email)))
 	checks := []struct {
@@ -72,6 +81,15 @@ func (h *PasswordResetHandler) allow(r *http.Request, action, email string,
 		{"pwreset:" + action + ":ip:" + middleware.ClientIP(r, h.TrustProxy), ipLimit, ipWindow},
 		{"pwreset:" + action + ":email:" + hex.EncodeToString(sum[:16]), emailLimit, emailWindow},
 	}
+	if h.Guard != nil {
+		for _, c := range checks {
+			v := h.Guard.Allow(r.Context(), c.key, ratelimit.Spec{Capacity: c.limit, Every: c.window / time.Duration(c.limit)})
+			if !v.Allowed {
+				return false, v.RetryAfter, v.Unavailable
+			}
+		}
+		return true, 0, false
+	}
 	for _, c := range checks {
 		d, err := h.Limiter.Allow(r.Context(), c.key, c.limit, c.window)
 		if err != nil {
@@ -79,10 +97,20 @@ func (h *PasswordResetHandler) allow(r *http.Request, action, email string,
 			continue
 		}
 		if !d.Allowed {
-			return false, d.RetryAfter
+			return false, d.RetryAfter, false
 		}
 	}
-	return true, 0
+	return true, 0, false
+}
+
+// refuse answers a rate-limit refusal: 429, or 503 when protection could not
+// be maintained.
+func (h *PasswordResetHandler) refuse(w http.ResponseWriter, r *http.Request, wait time.Duration, unavailable bool) {
+	if unavailable {
+		middleware.WriteLimitRefusal(w, r, ratelimit.Verdict{Unavailable: true, RetryAfter: wait}, h.Log)
+		return
+	}
+	h.fail(w, r, apperr.RateLimited(wait))
 }
 
 func (h *PasswordResetHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
@@ -99,7 +127,7 @@ func (h *PasswordResetHandler) ForgotPassword(w http.ResponseWriter, r *http.Req
 	// service does all account-dependent work in the background, so the
 	// response and its timing are the same for every address. Over the limit
 	// the answer is still the same 204; the request is just not processed.
-	if ok, _ := h.allow(r, "forgot", req.Email, forgotIPLimit, forgotIPWindow, forgotEmailLimit, forgotEmailWindow); ok {
+	if ok, _, _ := h.allow(r, "forgot", req.Email, forgotIPLimit, forgotIPWindow, forgotEmailLimit, forgotEmailWindow); ok {
 		h.Svc.RequestResetAsync(req.Email)
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -111,8 +139,8 @@ func (h *PasswordResetHandler) ResetPassword(w http.ResponseWriter, r *http.Requ
 		h.fail(w, r, err)
 		return
 	}
-	if ok, wait := h.allow(r, "confirm", req.Email, confirmIPLimit, confirmIPWindow, confirmEmailLimit, confirmEmailWindow); !ok {
-		h.fail(w, r, apperr.RateLimited(wait))
+	if ok, wait, unavail := h.allow(r, "confirm", req.Email, confirmIPLimit, confirmIPWindow, confirmEmailLimit, confirmEmailWindow); !ok {
+		h.refuse(w, r, wait, unavail)
 		return
 	}
 	if err := h.Svc.ConfirmReset(r.Context(), req.Email, req.Code, req.NewPassword); err != nil {
@@ -136,8 +164,8 @@ func (h *PasswordResetHandler) RequestSetPassword(w http.ResponseWriter, r *http
 		h.fail(w, r, apperr.Unauthenticated("Authentication required"))
 		return
 	}
-	if allowed, wait := h.allow(r, "setpw-request", claims.UserID, forgotIPLimit, forgotIPWindow, forgotEmailLimit, forgotEmailWindow); !allowed {
-		h.fail(w, r, apperr.RateLimited(wait))
+	if allowed, wait, unavail := h.allow(r, "setpw-request", claims.UserID, forgotIPLimit, forgotIPWindow, forgotEmailLimit, forgotEmailWindow); !allowed {
+		h.refuse(w, r, wait, unavail)
 		return
 	}
 	if err := h.Svc.RequestSetPassword(r.Context(), claims.UserID); err != nil {
@@ -161,8 +189,8 @@ func (h *PasswordResetHandler) SetPassword(w http.ResponseWriter, r *http.Reques
 		h.fail(w, r, err)
 		return
 	}
-	if allowed, wait := h.allow(r, "setpw-confirm", claims.UserID, confirmIPLimit, confirmIPWindow, confirmEmailLimit, confirmEmailWindow); !allowed {
-		h.fail(w, r, apperr.RateLimited(wait))
+	if allowed, wait, unavail := h.allow(r, "setpw-confirm", claims.UserID, confirmIPLimit, confirmIPWindow, confirmEmailLimit, confirmEmailWindow); !allowed {
+		h.refuse(w, r, wait, unavail)
 		return
 	}
 	if err := h.Svc.SetInitialPassword(r.Context(), claims.UserID, req.Code, req.NewPassword); err != nil {

@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -324,4 +325,44 @@ func randomToken(n int) (string, error) {
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// CodeAlreadySeller is returned when a seller asks to become a seller.
+const CodeAlreadySeller = "ALREADY_SELLER"
+
+// BecomeSeller turns the signed-in BUYER into a SELLER on the same account.
+// Only the role changes: the id, email, password, linked Google account,
+// name and every order or other record stay as they are, so both sign-in
+// methods keep reaching the same account. setup creates the shop (name and
+// address) and must succeed for the upgrade to stay; if it fails, the role is
+// put back to BUYER and the account is exactly as before.
+func (s *AuthService) BecomeSeller(ctx context.Context, userID string, setup func(ctx context.Context) error) (*models.User, error) {
+	u, err := s.users.FindByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, apperr.Unauthenticated("Invalid or expired session")
+		}
+		return nil, err
+	}
+	if u.Status != models.StatusActive {
+		return nil, apperr.AccountSuspended()
+	}
+	switch u.Role {
+	case models.RoleBuyer:
+	case models.RoleSeller:
+		return nil, apperr.New(http.StatusConflict, CodeAlreadySeller, "This account is already a seller")
+	default:
+		return nil, apperr.Forbidden("This account type cannot become a seller")
+	}
+	if err := s.users.UpdateRole(ctx, u.ID, models.RoleSeller); err != nil {
+		return nil, err
+	}
+	if err := setup(ctx); err != nil {
+		if rerr := s.users.UpdateRole(context.WithoutCancel(ctx), u.ID, models.RoleBuyer); rerr != nil {
+			return nil, errors.Join(err, rerr)
+		}
+		return nil, err
+	}
+	u.Role = models.RoleSeller
+	return u, nil
 }

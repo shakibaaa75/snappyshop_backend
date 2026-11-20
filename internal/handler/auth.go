@@ -55,11 +55,18 @@ func toUserDTO(u *models.User, storeSlug string) UserDTO {
 	}
 }
 
+// KeyLimiter limits attempts per key (a normalised email). It is satisfied by
+// the in-process *middleware.KeyedLimiter and by the Redis-backed
+// *ratelimit.KeyedAllow, so the login handler does not care which one runs.
+type KeyLimiter interface {
+	Allow(key string) (bool, time.Duration)
+}
+
 type AuthHandler struct {
 	Svc          *service.AuthService
 	StoreDesign  *service.StoreDesignService
 	Cookies      httpx.CookieSettings
-	EmailLimiter *middleware.KeyedLimiter
+	EmailLimiter KeyLimiter
 	Log          *slog.Logger
 }
 
@@ -189,5 +196,47 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slug := h.lookupStoreSlug(r.Context(), u)
+	httpx.WriteJSON(w, http.StatusOK, userResponse{User: toUserDTO(u, slug)})
+}
+
+type becomeSellerRequest struct {
+	StoreName string `json:"storeName"`
+	StoreSlug string `json:"storeSlug"`
+}
+
+// BecomeSeller (POST /auth/become-seller, signed in as a buyer) upgrades the
+// same account to a seller. The shop name and address are required, because
+// a seller cannot exist without them; they are checked before anything
+// changes. The session stays valid and the user lands on the seller dashboard.
+func (h *AuthHandler) BecomeSeller(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.ClaimsFrom(r.Context())
+	if !ok {
+		h.fail(w, r, apperr.Unauthenticated("Authentication required"))
+		return
+	}
+	if h.StoreDesign == nil {
+		h.fail(w, r, apperr.NotFound())
+		return
+	}
+	var req becomeSellerRequest
+	if err := httpx.DecodeJSON(w, r, &req, httpx.MaxBodyBytes); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	name, slug, err := h.StoreDesign.CheckNewStore(r.Context(), claims.UserID, req.StoreName, req.StoreSlug)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	u, err := h.Svc.BecomeSeller(r.Context(), claims.UserID, func(ctx context.Context) error {
+		return h.StoreDesign.SaveDraft(ctx, claims.UserID, map[string]any{
+			"storeName": name,
+			"storeSlug": slug,
+		})
+	})
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
 	httpx.WriteJSON(w, http.StatusOK, userResponse{User: toUserDTO(u, slug)})
 }

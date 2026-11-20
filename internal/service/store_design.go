@@ -319,6 +319,30 @@ func (s *StoreDesignService) SaveDraft(ctx context.Context, sellerID string, des
 	return err
 }
 
+// CheckNewStore validates the shop name and address a buyer picks when
+// upgrading to a seller, using the same rules as the first save of a store.
+// It returns the cleaned name and address. Nothing is stored.
+func (s *StoreDesignService) CheckNewStore(ctx context.Context, userID, rawName, rawSlug string) (name, slug string, err error) {
+	if name, err = normalizeStoreName(rawName); err != nil {
+		return "", "", err
+	}
+	slug = strings.ToLower(strings.TrimSpace(rawSlug))
+	if slug == "" {
+		return "", "", apperr.Validation(map[string]string{"storeSlug": "Store address is required"})
+	}
+	if err = validateSlug(slug); err != nil {
+		return "", "", err
+	}
+	taken, err := s.repo.SlugTaken(ctx, slug, userID)
+	if err != nil {
+		return "", "", err
+	}
+	if taken {
+		return "", "", apperr.Conflict(apperr.CodeSlugTaken, "This store address is already in use", "storeSlug")
+	}
+	return name, slug, nil
+}
+
 func slugCooldownError(next time.Time) error {
 	msg := fmt.Sprintf(
 		"You can change your store address again on %s",

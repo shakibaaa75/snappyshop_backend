@@ -29,7 +29,6 @@ import (
 	"shopbd/backend/internal/oauth"
 	"shopbd/backend/internal/password"
 	"shopbd/backend/internal/payment/sslcommerz"
-	"shopbd/backend/internal/ratelimit"
 	"shopbd/backend/internal/repository/mongorepo"
 	"shopbd/backend/internal/router"
 	"shopbd/backend/internal/secretbox"
@@ -369,21 +368,14 @@ func run() error {
 		resetSvc.LogCodesTo(log)
 	}
 
-	// Shared rate limiting for the password reset endpoints. Without REDIS_URL
-	// only the per-process limiter runs, which is weaker once there is more
-	// than one API instance.
-	var resetLimiter ratelimit.Limiter
-	if cfg.RedisURL != "" {
-		rl, err := ratelimit.NewRedis(ctx, cfg.RedisURL)
-		if err != nil {
-			return fmt.Errorf("redis: %w", err)
-		}
-		defer rl.Close()
-		resetLimiter = rl
-		log.Info("password reset rate limiting: redis")
-	} else if cfg.IsProduction() {
-		log.Warn("REDIS_URL not set: password reset rate limits are per instance only")
+	// Redis: shared token-bucket rate limiting for login / password reset and
+	// the stampede-protected cache. An unreachable Redis does not stop startup:
+	// both fall back to their controlled degraded modes (see redis.go).
+	rt, err := setupRedis(ctx, cfg, log)
+	if err != nil {
+		return fmt.Errorf("redis: %w", err)
 	}
+	defer rt.Close()
 
 	// Courier integrations. The feature is off until COURIER_ENCRYPTION_KEY and
 	// COURIER_FINGERPRINT_KEY are set; a half-set or invalid setup stops startup,
@@ -701,7 +693,8 @@ func run() error {
 			Categories:         categorySvc,
 			Orders:             orderSvc,
 			PasswordReset:      resetSvc,
-			ResetLimiter:       resetLimiter,
+			RateGuard:          rt.RateGuard,
+			Cache:              rt.Cache,
 			EmailVerification:  verifySvc,
 			Analytics:          analyticsSvc,
 			Tracking:           trackingSvc,
