@@ -121,3 +121,53 @@ func (h *PasswordResetHandler) ResetPassword(w http.ResponseWriter, r *http.Requ
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+type setPasswordRequest struct {
+	Code        string `json:"code"`
+	NewPassword string `json:"newPassword"`
+}
+
+// RequestSetPassword (POST /auth/password/set/request, signed in) emails a
+// code to the account's own address. It is for accounts that signed up with
+// Google / Apple and have no password yet.
+func (h *PasswordResetHandler) RequestSetPassword(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.ClaimsFrom(r.Context())
+	if !ok {
+		h.fail(w, r, apperr.Unauthenticated("Authentication required"))
+		return
+	}
+	if allowed, wait := h.allow(r, "setpw-request", claims.UserID, forgotIPLimit, forgotIPWindow, forgotEmailLimit, forgotEmailWindow); !allowed {
+		h.fail(w, r, apperr.RateLimited(wait))
+		return
+	}
+	if err := h.Svc.RequestSetPassword(r.Context(), claims.UserID); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// SetPassword (POST /auth/password/set, signed in) adds a password to an
+// account that has none, after the emailed code is confirmed. Google / Apple
+// sign-in keeps working, and so does the current session.
+func (h *PasswordResetHandler) SetPassword(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.ClaimsFrom(r.Context())
+	if !ok {
+		h.fail(w, r, apperr.Unauthenticated("Authentication required"))
+		return
+	}
+	var req setPasswordRequest
+	if err := httpx.DecodeJSON(w, r, &req, httpx.MaxBodyBytes); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	if allowed, wait := h.allow(r, "setpw-confirm", claims.UserID, confirmIPLimit, confirmIPWindow, confirmEmailLimit, confirmEmailWindow); !allowed {
+		h.fail(w, r, apperr.RateLimited(wait))
+		return
+	}
+	if err := h.Svc.SetInitialPassword(r.Context(), claims.UserID, req.Code, req.NewPassword); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

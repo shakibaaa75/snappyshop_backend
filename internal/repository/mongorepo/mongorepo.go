@@ -74,6 +74,11 @@ func (r *Users) FindByProvider(ctx context.Context, provider, subject string) (*
 
 // LinkProvider attaches a Google / Apple account to an existing user. The
 // provider has already confirmed the email, so it is marked verified too.
+//
+// Only the provider ID, emailVerified and updatedAt are written: the password
+// hash, role and status are never touched. The update only applies while the
+// slot is empty (or already holds this same ID), so a different linked account
+// is never silently replaced.
 func (r *Users) LinkProvider(ctx context.Context, userID, provider, subject string) error {
 	field := models.ProviderField(provider)
 	if field == "" || subject == "" {
@@ -82,7 +87,10 @@ func (r *Users) LinkProvider(ctx context.Context, userID, provider, subject stri
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()
 	res, err := r.col.UpdateOne(ctx,
-		bson.D{{Key: "_id", Value: userID}},
+		bson.D{
+			{Key: "_id", Value: userID},
+			{Key: field, Value: bson.D{{Key: "$in", Value: bson.A{nil, "", subject}}}},
+		},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: field, Value: subject},
 			{Key: "emailVerified", Value: true},
@@ -90,10 +98,17 @@ func (r *Users) LinkProvider(ctx context.Context, userID, provider, subject stri
 		}}},
 	)
 	if err != nil {
+		if mongo.IsDuplicateKeyError(err) { // unique index: ID belongs to another user
+			return repository.ErrProviderLinked
+		}
 		return err
 	}
 	if res.MatchedCount == 0 {
-		return repository.ErrNotFound
+		// Either no such user, or the slot holds a different ID.
+		if _, ferr := r.FindByID(ctx, userID); ferr != nil {
+			return ferr
+		}
+		return repository.ErrProviderLinked
 	}
 	return nil
 }

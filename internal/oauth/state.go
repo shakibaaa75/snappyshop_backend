@@ -108,3 +108,60 @@ func Challenge(verifier string) string {
 func SameString(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
+
+/* ---- pending account link ---- */
+
+const (
+	linkAudience = "shopbd-oauth-link"
+	linkTTL      = 10 * time.Minute
+)
+
+// PendingLink is kept in a signed, short-lived cookie after Google / Apple has
+// vouched for an email that already belongs to an account. It records what the
+// provider confirmed, but grants nothing: the person must still prove they own
+// the existing account (password or active session) before it is linked.
+type PendingLink struct {
+	Provider string
+	Subject  string // the provider's ID for this person
+	UserID   string // the existing account to link to
+	Email    string // shown to the person so they know which account
+	Name     string
+}
+
+type linkClaims struct {
+	Provider string `json:"p"`
+	Subject  string `json:"s"`
+	UserID   string `json:"u"`
+	Email    string `json:"e"`
+	Name     string `json:"n,omitempty"`
+	jwt.RegisteredClaims
+}
+
+// SealLink signs a PendingLink. It uses a different audience than the OAuth
+// state cookie, so one can never be presented as the other.
+func (s *Signer) SealLink(l PendingLink) (string, error) {
+	now := s.now()
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, linkClaims{
+		Provider: l.Provider, Subject: l.Subject, UserID: l.UserID, Email: l.Email, Name: l.Name,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Audience:  jwt.ClaimStrings{linkAudience},
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(linkTTL)),
+		},
+	}).SignedString(s.key)
+}
+
+func (s *Signer) OpenLink(token string) (*PendingLink, error) {
+	c := &linkClaims{}
+	_, err := jwt.ParseWithClaims(token, c,
+		func(*jwt.Token) (any, error) { return s.key, nil },
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithAudience(linkAudience),
+		jwt.WithExpirationRequired(),
+		jwt.WithTimeFunc(s.now),
+	)
+	if err != nil || c.Provider == "" || c.Subject == "" || c.UserID == "" {
+		return nil, errors.New("oauth: invalid link token")
+	}
+	return &PendingLink{Provider: c.Provider, Subject: c.Subject, UserID: c.UserID, Email: c.Email, Name: c.Name}, nil
+}

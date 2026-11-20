@@ -73,12 +73,28 @@ func (r *Users) FindByProvider(_ context.Context, provider, subject string) (*mo
 }
 
 // LinkProvider attaches a Google / Apple account and marks the email verified.
+// Like the Mongo version it never touches the password and refuses to replace
+// a different linked account or take one that belongs to another user.
 func (r *Users) LinkProvider(_ context.Context, userID, provider, subject string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	u, ok := r.byID[userID]
 	if !ok || models.ProviderField(provider) == "" || subject == "" {
 		return repository.ErrNotFound
+	}
+	cur := func(x *models.User) string {
+		if provider == models.ProviderGoogle {
+			return x.GoogleID
+		}
+		return x.AppleID
+	}
+	if c := cur(u); c != "" && c != subject {
+		return repository.ErrProviderLinked
+	}
+	for _, o := range r.byID {
+		if o.ID != userID && cur(o) == subject {
+			return repository.ErrProviderLinked
+		}
 	}
 	u.SetProviderID(provider, subject)
 	u.EmailVerified = true

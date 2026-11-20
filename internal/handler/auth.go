@@ -24,6 +24,9 @@ type UserDTO struct {
 	Role      string `json:"role"`
 	StoreSlug string `json:"storeSlug,omitempty"`
 	CreatedAt string `json:"createdAt"`
+	// Sign-in methods on the account ("email", "google", "apple"), so the UI
+	// can offer "add a sign-in method". It only says which exist, no secrets.
+	SignInMethods []string `json:"signInMethods"`
 }
 
 type userResponse struct {
@@ -31,13 +34,24 @@ type userResponse struct {
 }
 
 func toUserDTO(u *models.User, storeSlug string) UserDTO {
+	methods := []string{}
+	if u.PasswordHash != "" {
+		methods = append(methods, "email")
+	}
+	if u.GoogleID != "" {
+		methods = append(methods, models.ProviderGoogle)
+	}
+	if u.AppleID != "" {
+		methods = append(methods, models.ProviderApple)
+	}
 	return UserDTO{
-		ID:        u.ID,
-		Name:      u.Name,
-		Email:     u.Email,
-		Role:      string(u.Role),
-		StoreSlug: storeSlug,
-		CreatedAt: u.CreatedAt.UTC().Format(time.RFC3339),
+		SignInMethods: methods,
+		ID:            u.ID,
+		Name:          u.Name,
+		Email:         u.Email,
+		Role:          string(u.Role),
+		StoreSlug:     storeSlug,
+		CreatedAt:     u.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

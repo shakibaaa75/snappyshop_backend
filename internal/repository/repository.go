@@ -12,6 +12,10 @@ import (
 var (
 	ErrNotFound       = errors.New("repository: not found")
 	ErrDuplicateEmail = errors.New("repository: duplicate email")
+	// ErrProviderLinked means LinkProvider refused: this user already has a
+	// different Google / Apple account linked, or this Google / Apple account
+	// already belongs to another user. Nothing was changed.
+	ErrProviderLinked = errors.New("repository: provider account already linked")
 	ErrSlugTaken      = errors.New("repository: slug taken")
 	// ErrIdentityConflict means the shop name/URL change no longer applies
 	// (someone changed it concurrently, or the rules now forbid it).
@@ -56,6 +60,9 @@ type UserRepository interface {
 	UpdateRole(ctx context.Context, userID string, role models.Role) error
 	// Social sign-in (Google / Apple)
 	FindByProvider(ctx context.Context, provider, subject string) (*models.User, error)
+	// LinkProvider attaches the provider account. It never touches the password
+	// hash, role or status. It is idempotent for the same subject and returns
+	// ErrProviderLinked rather than replacing a different linked account.
 	LinkProvider(ctx context.Context, userID, provider, subject string) error
 }
 

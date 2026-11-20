@@ -323,6 +323,10 @@ func New(d Deps) http.Handler {
 			a.With(forgotLimit).Post("/forgot-password", reset.ForgotPassword)
 			a.With(resetLimit).Post("/reset-password", reset.ResetPassword)
 
+			// Google-first accounts add a password (signed in + emailed code).
+			a.With(forgotLimit, middleware.Authenticate(d.Auth, log)).Post("/password/set/request", reset.RequestSetPassword)
+			a.With(resetLimit, middleware.Authenticate(d.Auth, log)).Post("/password/set", reset.SetPassword)
+
 			if d.EmailVerification != nil {
 				ev := &handler.EmailVerificationHandler{Svc: d.EmailVerification, Log: log}
 				sendCodeLimit := middleware.RateLimit(middleware.NewKeyedLimiter(limits.SendEmailCode.Every, limits.SendEmailCode.Burst), cfg.TrustProxy, log)
@@ -335,6 +339,11 @@ func New(d Deps) http.Handler {
 			a.With(loginLimit).Get("/google", socialH.GoogleStart)
 			a.With(loginLimit).Get("/google/callback", socialH.GoogleCallback)
 			a.With(loginLimit).Get("/apple", socialH.AppleStart)
+			// Connect Google / Apple to an existing account after the owner
+			// proves who they are (password, or a session for that account).
+			a.Get("/social/pending", socialH.PendingLink)
+			a.Delete("/social/pending", socialH.CancelLink)
+			a.With(loginLimit).Post("/social/link", socialH.ConfirmLink)
 			// POST /apple/callback is registered on the root router (no CSRF).
 		})
 

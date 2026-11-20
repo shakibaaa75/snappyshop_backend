@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net/http"
 	"strings"
 	"time"
 
@@ -230,6 +231,100 @@ func (s *PasswordResetService) ConfirmReset(ctx context.Context, email, code, ne
 		return err
 	}
 
+	if err := s.redeemCode(ctx, u, code); err != nil {
+		return err
+	}
+	hash, err := s.hasher.Hash(newPassword)
+	if err != nil {
+		return err
+	}
+
+	if err := s.users.UpdatePassword(ctx, u.ID, hash); err != nil {
+		return err
+	}
+
+	// Invalidate every existing session so a stolen refresh cookie cannot
+	// keep access after the password change.
+	if s.tokens != nil {
+		_ = s.tokens.RevokeAllForUser(ctx, u.ID, s.now().UTC())
+	}
+	return nil
+}
+
+// CodePasswordAlreadySet is returned when someone tries to add a first
+// password to an account that already has one.
+const CodePasswordAlreadySet = "PASSWORD_ALREADY_SET"
+
+func passwordAlreadySet() error {
+	return apperr.New(http.StatusConflict, CodePasswordAlreadySet,
+		"This account already has a password. Use \"Forgot password\" to change it.")
+}
+
+// activeUser loads the signed-in user and refuses suspended accounts.
+func (s *PasswordResetService) activeUser(ctx context.Context, userID string) (*models.User, error) {
+	u, err := s.users.FindByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, apperr.Unauthenticated("Invalid or expired session")
+		}
+		return nil, err
+	}
+	if u.Status != models.StatusActive {
+		return nil, apperr.AccountSuspended()
+	}
+	return u, nil
+}
+
+// RequestSetPassword emails a one-time code to the signed-in user's own
+// address. It is the second proof (besides the session) needed to add a
+// password to an account that signed up with Google / Apple, so a stolen
+// session alone cannot add a password nobody else knows about.
+func (s *PasswordResetService) RequestSetPassword(ctx context.Context, userID string) error {
+	u, err := s.activeUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.PasswordHash != "" {
+		return passwordAlreadySet()
+	}
+	return s.RequestReset(ctx, u.Email)
+}
+
+// SetInitialPassword gives a password-less account (Google / Apple sign-up) a
+// password, after checking the emailed code. It refuses accounts that already
+// have a password, so it can never overwrite one. Linked Google / Apple IDs,
+// the role and all data stay as they are, and the current session stays valid.
+func (s *PasswordResetService) SetInitialPassword(ctx context.Context, userID, code, newPassword string) error {
+	if n := len([]rune(newPassword)); n < 8 {
+		return apperr.Validation(map[string]string{"password": "Password must be at least 8 characters"})
+	} else if len(newPassword) > 128 {
+		return apperr.Validation(map[string]string{"password": "Password must be at most 128 characters"})
+	}
+	code = strings.TrimSpace(code)
+	if !isSixDigits(code) {
+		return invalidResetCode()
+	}
+	u, err := s.activeUser(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if u.PasswordHash != "" {
+		return passwordAlreadySet()
+	}
+	if err := s.redeemCode(ctx, u, code); err != nil {
+		return err
+	}
+	hash, err := s.hasher.Hash(newPassword)
+	if err != nil {
+		return err
+	}
+	return s.users.UpdatePassword(ctx, u.ID, hash)
+}
+
+// redeemCode checks the emailed code for this user and burns it. Every failure
+// is the same invalidResetCode answer. Each challenge allows resetMaxAttempts
+// wrong guesses and a code is single-use (Consume is atomic).
+func (s *PasswordResetService) redeemCode(ctx context.Context, u *models.User, code string) error {
 	pr, err := s.resets.FindByUserID(ctx, u.ID)
 	if err != nil {
 		if errors.Is(err, repository.ErrResetNotFound) {
@@ -269,11 +364,6 @@ func (s *PasswordResetService) ConfirmReset(ctx context.Context, email, code, ne
 		return invalidResetCode()
 	}
 
-	hash, err := s.hasher.Hash(newPassword)
-	if err != nil {
-		return err
-	}
-
 	// Burn the code before changing the password. Consume is atomic, so when
 	// two requests present the right code at once only one of them proceeds.
 	won, err := s.resets.Consume(ctx, pr.ID)
@@ -282,16 +372,6 @@ func (s *PasswordResetService) ConfirmReset(ctx context.Context, email, code, ne
 	}
 	if !won {
 		return invalidResetCode()
-	}
-
-	if err := s.users.UpdatePassword(ctx, u.ID, hash); err != nil {
-		return err
-	}
-
-	// Invalidate every existing session so a stolen refresh cookie cannot
-	// keep access after the password change.
-	if s.tokens != nil {
-		_ = s.tokens.RevokeAllForUser(ctx, u.ID, now)
 	}
 	return nil
 }

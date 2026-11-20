@@ -15,6 +15,7 @@ import (
 	"shopbd/backend/internal/models"
 	"shopbd/backend/internal/oauth"
 	"shopbd/backend/internal/service"
+	"shopbd/backend/internal/validation"
 )
 
 // SocialHandler runs "Continue with Google / Apple".
@@ -23,7 +24,7 @@ import (
 // with JSON: success and failure both end in a redirect to the website.
 // A failure lands on /login?error=social_<reason>.
 type SocialHandler struct {
-	Auth        *AuthHandler // reused so the session cookies match normal login exactly
+	Auth        *AuthHandler  // reused so the session cookies match normal login exactly
 	Google      *oauth.Google // nil = not configured
 	Apple       *oauth.Apple  // nil = not configured
 	Signer      *oauth.Signer
@@ -172,13 +173,32 @@ func (h *SocialHandler) complete(
 	}
 
 	u, pair, err := h.Auth.Svc.LoginWithSocial(ctx, service.SocialProfile{
-		Provider:      provider,
-		Subject:       profile.Subject,
-		Email:         profile.Email,
-		EmailVerified: profile.EmailVerified,
-		Name:          profile.Name,
+		Provider:            provider,
+		Subject:             profile.Subject,
+		Email:               profile.Email,
+		EmailVerified:       profile.EmailVerified,
+		Name:                profile.Name,
+		AuthenticatedUserID: h.sessionUserID(r),
 	})
 	if err != nil {
+		var lr *service.LinkRequiredError
+		if errors.As(err, &lr) {
+			// The email belongs to an existing account. Nothing is linked and
+			// nobody is signed in yet: remember what the provider confirmed in
+			// a signed cookie and ask the owner to prove who they are.
+			sealed, serr := h.Signer.SealLink(oauth.PendingLink{
+				Provider: lr.Link.Provider, Subject: lr.Link.Subject,
+				UserID: lr.Link.UserID, Email: lr.Link.Email, Name: lr.Link.Name,
+			})
+			if serr != nil {
+				h.Log.Error("social: seal link", "error", serr.Error())
+				h.fail(w, r, "failed")
+				return
+			}
+			http.SetCookie(w, h.linkCookie(sealed, int(linkCookieTTL.Seconds())))
+			h.fail(w, r, "link_required")
+			return
+		}
 		h.fail(w, r, reasonFor(err))
 		if reasonFor(err) == "failed" {
 			h.Log.Error("social: sign-in failed", "provider", provider, "error", err.Error())
@@ -203,6 +223,8 @@ func reasonFor(err error) string {
 			return "not_allowed"
 		case apperr.CodeEmailTaken:
 			return "email_taken"
+		case service.CodeSocialAlreadyLinked:
+			return "already_linked"
 		}
 	}
 	return "failed"
@@ -255,4 +277,114 @@ func landing(u *models.User, storeSlug, next string) string {
 		return "/seller/setup"
 	}
 	return "/account"
+}
+
+/* ---- linking Google / Apple to an existing account ---- */
+
+const (
+	linkCookieName = "oauth_link"
+	linkCookieTTL  = 10 * time.Minute
+)
+
+// linkCookie carries the signed "pending link". It is host-only, HttpOnly and
+// scoped to the auth routes, like the state cookie.
+func (h *SocialHandler) linkCookie(value string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     linkCookieName,
+		Value:    value,
+		Path:     httpx.RefreshCookiePath,
+		MaxAge:   maxAge,
+		HttpOnly: true,
+		Secure:   h.Secure,
+		SameSite: http.SameSiteLaxMode,
+	}
+}
+
+// sessionUserID returns the account this browser is signed in to, or "".
+func (h *SocialHandler) sessionUserID(r *http.Request) string {
+	c, err := r.Cookie(httpx.SessionCookie)
+	if err != nil || c.Value == "" {
+		return ""
+	}
+	claims, err := h.Auth.Svc.AuthenticateAccess(c.Value)
+	if err != nil {
+		return ""
+	}
+	return claims.UserID
+}
+
+func (h *SocialHandler) pending(r *http.Request) (*oauth.PendingLink, error) {
+	c, err := r.Cookie(linkCookieName)
+	if err != nil {
+		return nil, apperr.BadRequest("No sign-in is waiting to be connected. Please try Continue with Google again.")
+	}
+	l, err := h.Signer.OpenLink(c.Value)
+	if err != nil {
+		return nil, apperr.BadRequest("This request expired. Please try Continue with Google again.")
+	}
+	return l, nil
+}
+
+type pendingLinkResponse struct {
+	Provider string `json:"provider"`
+	Email    string `json:"email"`
+}
+
+// PendingLink (GET /auth/social/pending) tells the login page which provider
+// and account are waiting for the owner to confirm. It reveals nothing the
+// person did not just prove to the provider: the email is their own.
+func (h *SocialHandler) PendingLink(w http.ResponseWriter, r *http.Request) {
+	l, err := h.pending(r)
+	if err != nil {
+		httpx.WriteError(w, r, err, h.Log)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, pendingLinkResponse{Provider: l.Provider, Email: l.Email})
+}
+
+// CancelLink (DELETE /auth/social/pending) forgets the pending link.
+func (h *SocialHandler) CancelLink(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, h.linkCookie("", -1))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type confirmLinkRequest struct {
+	// Password of the existing account. May be empty when the browser already
+	// has a session for that account (accounts without a password).
+	Password string `json:"password"`
+}
+
+// ConfirmLink (POST /auth/social/link) connects the waiting Google / Apple
+// identity to the existing account after the owner proves who they are, then
+// signs them in to that same account.
+func (h *SocialHandler) ConfirmLink(w http.ResponseWriter, r *http.Request) {
+	var req confirmLinkRequest
+	if err := httpx.DecodeJSON(w, r, &req, httpx.MaxBodyBytes); err != nil {
+		httpx.WriteError(w, r, err, h.Log)
+		return
+	}
+	l, err := h.pending(r)
+	if err != nil {
+		httpx.WriteError(w, r, err, h.Log)
+		return
+	}
+	// Same per-email guess limit as the password login form, so this endpoint
+	// cannot be used as a faster way to try passwords.
+	if h.Auth.EmailLimiter != nil {
+		if ok, wait := h.Auth.EmailLimiter.Allow(validation.NormalizeEmail(l.Email)); !ok {
+			httpx.WriteError(w, r, apperr.RateLimited(wait), h.Log)
+			return
+		}
+	}
+	u, pair, err := h.Auth.Svc.LinkSocial(r.Context(), service.SocialLink{
+		Provider: l.Provider, Subject: l.Subject, UserID: l.UserID, Email: l.Email, Name: l.Name,
+	}, req.Password, h.sessionUserID(r))
+	if err != nil {
+		httpx.WriteError(w, r, err, h.Log)
+		return
+	}
+	http.SetCookie(w, h.linkCookie("", -1)) // single use
+	h.Auth.setAuthCookies(w, pair)
+	slug := h.Auth.lookupStoreSlug(r.Context(), u)
+	httpx.WriteJSON(w, http.StatusOK, userResponse{User: toUserDTO(u, slug)})
 }
