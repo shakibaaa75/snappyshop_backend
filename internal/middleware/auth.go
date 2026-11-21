@@ -89,3 +89,16 @@ func RequireAdminGate(g AdminGateChecker, log *slog.Logger) func(http.Handler) h
 		})
 	}
 }
+
+func OptionalCheckoutAuth(a AccessAuthenticator, log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		authenticated := Authenticate(a, log)(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, err := r.Cookie(httpx.SessionCookie); err == http.ErrNoCookie {
+				next.ServeHTTP(w, r)
+				return
+			}
+			authenticated.ServeHTTP(w, r)
+		})
+	}
+}

@@ -23,6 +23,7 @@ import (
 	"shopbd/backend/internal/courierconn"
 	"shopbd/backend/internal/customdomain"
 	"shopbd/backend/internal/database"
+	"shopbd/backend/internal/handler"
 	"shopbd/backend/internal/jobs"
 	"shopbd/backend/internal/mailer"
 	"shopbd/backend/internal/models"
@@ -201,6 +202,7 @@ func run() error {
 		}
 		orderSvc.SetPaymentWindow(d)
 	}
+	go (handler.Reviews{DB: db, Log: log}).RunSummaryWorker(ctx)
 	go orderSvc.RunReservationSweeper(ctx, time.Minute)
 
 	// Brand prefix of readable order numbers: SNAPPY-20261115-000123.
@@ -244,6 +246,10 @@ func run() error {
 	}
 	log.Info("payment gateway", "provider", "sslcommerz", "sandbox", gwSandbox)
 
+	var reviewGateway *sslcommerz.Client
+	if !cfg.IsProduction() || !gwSandbox {
+		reviewGateway = sslcommerz.New(sslcommerz.Config{StoreID: gwStoreID, StorePassword: gwStorePass, Sandbox: gwSandbox})
+	}
 	frontendURL := envOr("FRONTEND_URL", "http://localhost:3000")
 	subscriptionSvc := service.NewSubscriptionService(
 		mongorepo.NewSubscriptions(db),
@@ -685,6 +691,7 @@ func run() error {
 	srv := &http.Server{
 		Addr: ":" + cfg.Port,
 		Handler: router.New(router.Deps{
+			ReviewGateway:      reviewGateway,
 			Config:             cfg,
 			Log:                log,
 			Auth:               authSvc,

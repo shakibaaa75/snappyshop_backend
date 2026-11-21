@@ -147,7 +147,18 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database, log *slog.Logger) er
 		{CategoriesCollection, []mongo.IndexModel{
 			{Keys: bson.D{{Key: "sellerId", Value: 1}, {Key: "slug", Value: 1}}, Options: options.Index().SetName("uniq_categories_seller_slug").SetUnique(true)},
 		}},
+		{"product_reviews", []mongo.IndexModel{
+			{Keys: bson.D{{Key: "created", Value: -1}, {Key: "_id", Value: 1}}},
+			{Keys: bson.D{{Key: "order", Value: 1}}},
+			{Keys: bson.D{{Key: "updated", Value: 1}}},
+
+			{Keys: bson.D{{Key: "product", Value: 1}, {Key: "created", Value: -1}}},
+			{Keys: bson.D{{Key: "buyer", Value: 1}, {Key: "created", Value: -1}}},
+			{Keys: bson.D{{Key: "seller", Value: 1}, {Key: "created", Value: -1}}},
+		}},
 		{OrdersCollection, []mongo.IndexModel{
+			{Keys: bson.D{{Key: "updatedAt", Value: 1}}},
+			{Keys: bson.D{{Key: "buyerId", Value: 1}, {Key: "lines.productId", Value: 1}}},
 			{Keys: bson.D{{Key: "sellerId", Value: 1}, {Key: "createdAt", Value: -1}}, Options: options.Index().SetName("idx_orders_seller_created")},
 			{Keys: bson.D{{Key: "sellerId", Value: 1}, {Key: "status", Value: 1}, {Key: "createdAt", Value: -1}}, Options: options.Index().SetName("idx_orders_seller_status_created")},
 			{Keys: bson.D{{Key: "sellerId", Value: 1}, {Key: "number", Value: 1}}, Options: options.Index().SetName("uniq_orders_seller_number").SetUnique(true)},

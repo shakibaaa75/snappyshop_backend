@@ -21,6 +21,7 @@ import (
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
 	"shopbd/backend/internal/oauth"
+	"shopbd/backend/internal/payment/sslcommerz"
 	"shopbd/backend/internal/ratelimit"
 	"shopbd/backend/internal/repository/mongorepo"
 	"shopbd/backend/internal/service"
@@ -75,6 +76,7 @@ func DefaultLimits() Limits {
 }
 
 type Deps struct {
+	ReviewGateway      *sslcommerz.Client
 	Config             *config.Config
 	Log                *slog.Logger
 	Auth               *service.AuthService
@@ -330,7 +332,14 @@ func New(d Deps) http.Handler {
 	// signed state cookie and the nonce in the ID token protect it instead.
 	r.Post(httpx.RefreshCookiePath+"/apple/callback", socialH.AppleCallback)
 
+	reviews := handler.Reviews{DB: d.Mongo, Gateway: d.ReviewGateway, Log: log}
+	if d.Mongo != nil {
+		order.Reviews = &reviews
+	}
 	publicReadLimit := middleware.RateLimit(middleware.NewKeyedLimiter(500*time.Millisecond, 120), cfg.TrustProxy, log)
+	if d.Mongo != nil {
+		r.With(orderCreateLimit).Post(httpx.APIPrefix+"/orders/payment/ipn", reviews.OrderPaymentIPN)
+	}
 	trackLimit := middleware.RateLimit(middleware.NewKeyedLimiter(200*time.Millisecond, 60), cfg.TrustProxy, log)
 
 	r.Route(httpx.APIPrefix, func(api chi.Router) {
@@ -411,7 +420,7 @@ func New(d Deps) http.Handler {
 
 		api.With(publicReadLimit).Get("/store/{slug}", sd.PublicStore)
 		api.With(publicReadLimit).Get("/store/{slug}/products", prod.PublicList)
-		api.With(orderCreateLimit).Post("/store/{slug}/orders", order.Create)
+		api.With(orderCreateLimit, middleware.OptionalCheckoutAuth(d.Auth, log)).Post("/store/{slug}/orders", order.Create)
 		// Public: price a cart for a district (same rules as placing the order).
 		api.With(publicReadLimit).Post("/store/{slug}/delivery-quote", order.Quote)
 		api.With(publicReadLimit).Get("/store/{slug}/categories", cat.PublicList)
@@ -436,12 +445,22 @@ func New(d Deps) http.Handler {
 			api.With(publicReadLimit).Get("/store/{slug}/delivery-settings", deliveryH.Public)
 		}
 
+		if d.Mongo != nil {
+			api.With(publicReadLimit, middleware.NoStore).Get("/reviews", reviews.Public)
+		}
 		if buyerH != nil {
 			api.Route("/buyer", func(b chi.Router) {
 				b.Use(middleware.NoStore)
 				b.Use(middleware.Authenticate(d.Auth, log))
 				b.Use(middleware.RequireRole(log, models.RoleBuyer))
 
+				if d.Mongo != nil {
+					b.Get("/reviews", reviews.Buyer)
+					b.Get("/review-purchases", reviews.Purchases)
+					b.With(orderCreateLimit).Put("/reviews", reviews.Save)
+					b.With(orderCreateLimit).Post("/review-receipt", reviews.Receipt)
+				}
+				b.With(orderCreateLimit).Post("/store/{slug}/orders", order.Create)
 				b.Get("/profile", buyerH.Profile)
 				b.Put("/profile", buyerH.UpdateProfile)
 				b.Put("/preferences", buyerH.UpdatePreferences)
@@ -474,6 +493,10 @@ func New(d Deps) http.Handler {
 			s.Use(middleware.Authenticate(d.Auth, log))
 			s.Use(middleware.RequireRole(log, models.RoleSeller))
 
+			if d.Mongo != nil {
+				s.Get("/reviews", reviews.Seller)
+				s.With(orderCreateLimit).Post("/reviews/{id}", reviews.SellerAction)
+			}
 			s.Get("/store-design", sd.GetDraft)
 			s.Put("/store-design", sd.SaveDraft)
 			s.Post("/store-design/publish", sd.Publish)
@@ -626,6 +649,11 @@ func New(d Deps) http.Handler {
 					ar.Use(middleware.Authenticate(d.Auth, log))
 					ar.Use(middleware.RequireRole(log, models.RoleAdmin))
 
+					if d.Mongo != nil {
+						ar.Get("/reviews", reviews.Admin)
+						ar.Post("/review-order-evidence", reviews.RecordOrderEvidence)
+						ar.Post("/reviews/{id}", reviews.Moderate)
+					}
 					ar.Get("/dashboard", adminH.Dashboard)
 
 					// Fraud check: provider key, switches, history import.

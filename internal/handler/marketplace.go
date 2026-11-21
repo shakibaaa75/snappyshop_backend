@@ -453,8 +453,7 @@ func (h *MarketplaceHandler) Products(w http.ResponseWriter, r *http.Request) {
 		if !h.matchesCategory(p, cats, categoryFilter) {
 			continue
 		}
-		// Reviews are not collected yet, so every product has 0 reviews.
-		if minReviews > 0 {
+		if p.ReviewCount < minReviews {
 			continue
 		}
 		off := discountPercent(p)
@@ -492,7 +491,9 @@ func (h *MarketplaceHandler) Products(w http.ResponseWriter, r *http.Request) {
 		if search != "" {
 			sort.SliceStable(rows, func(i, j int) bool { return rows[i].score > rows[j].score })
 		}
-	default: // "newest", "best_rated" (no reviews yet) and unknown values
+	case "best_rated":
+		sort.SliceStable(rows, func(i, j int) bool { return rows[i].p.ReviewAverage > rows[j].p.ReviewAverage })
+	default: // Newest first.
 	}
 	// Deals: biggest discount first, so the home page shows the best ones
 	// even when the category has more than one page of deals.
@@ -529,8 +530,8 @@ func (h *MarketplaceHandler) Products(w http.ResponseWriter, r *http.Request) {
 			CategoryID:   p.CategoryID,
 			CategoryName: catName,
 			CategorySlug: catSlug,
-			Rating:       0,
-			Reviews:      0,
+			Rating:       p.ReviewAverage,
+			Reviews:      p.ReviewCount,
 			Sold:         sold[p.ID],
 			CreatedAt:    p.CreatedAt.UTC().Format(time.RFC3339),
 			Seller:       sellerDTO(store, counts[p.SellerID], completed[p.SellerID]),

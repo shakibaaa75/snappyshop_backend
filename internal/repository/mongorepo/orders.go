@@ -201,6 +201,9 @@ func (r *Orders) UpdateStatus(ctx context.Context, sellerID, id string, status m
 			{Key: "$push", Value: bson.D{{Key: "events", Value: models.OrderStatusEvent{Status: status, At: at, Note: note}}}},
 		}
 		var unset bson.D
+		if status != models.OrderDelivered {
+			unset = append(unset, bson.E{Key: "reviewReceipt", Value: ""})
+		}
 		switch {
 		case releasing:
 			set = append(set, bson.E{Key: "stockReserved", Value: false})
@@ -366,6 +369,10 @@ func (r *Orders) MarkPaid(ctx context.Context, sellerID, id string, paid bool) e
 		{Key: "paid", Value: paid},
 		{Key: "updatedAt", Value: time.Now().UTC()},
 	}}}
+	if !paid {
+		update = append(update, bson.E{Key: "$unset", Value: bson.M{"reviewReceipt": "", "reviewGatewayVerified": ""}})
+	}
+	update = append(update, bson.E{Key: "$push", Value: bson.M{"reviewEvidence": bson.M{"at": time.Now().UTC(), "actor": sellerID, "action": "payment status", "paid": paid}}})
 	if paid {
 		// Paid in time: the payment deadline no longer applies.
 		update = append(update, bson.E{Key: "$unset", Value: bson.D{{Key: "reservationExpiresAt", Value: ""}}})

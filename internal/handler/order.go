@@ -18,8 +18,9 @@ import (
 )
 
 type OrderHandler struct {
-	Svc *service.OrderService
-	Log *slog.Logger
+	Reviews *Reviews
+	Svc     *service.OrderService
+	Log     *slog.Logger
 	// Analytics is optional (nil = no conversion tracking). When set, every
 	// placed order is recorded as a "purchase" event for the seller.
 	Analytics *service.AnalyticsService
@@ -216,7 +217,12 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 			Qty:       l.Qty,
 		})
 	}
+	buyerID := ""
+	if c, ok := middleware.ClaimsFrom(r.Context()); ok && c.Role == models.RoleBuyer {
+		buyerID = c.UserID
+	}
 	order, err := h.Svc.CreateBySlug(r.Context(), slug, service.CreateOrderInput{
+		BuyerID:         buyerID,
 		CustomerName:    body.CustomerName,
 		CustomerPhone:   body.CustomerPhone,
 		CustomerEmail:   body.CustomerEmail,
@@ -344,6 +350,9 @@ func (h *OrderHandler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
+	if h.Reviews != nil && order.BuyerID != "" {
+		h.Reviews.RefreshOrder(r.Context(), order.ID)
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"order": toOrderDTO(order)})
 }
 
@@ -364,6 +373,9 @@ func (h *OrderHandler) MarkPaid(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.fail(w, r, err)
 		return
+	}
+	if h.Reviews != nil && order.BuyerID != "" {
+		h.Reviews.RefreshOrder(r.Context(), order.ID)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"order": toOrderDTO(order)})
 }

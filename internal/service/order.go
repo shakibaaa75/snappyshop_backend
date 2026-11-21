@@ -135,6 +135,7 @@ type OrderLineInput struct {
 }
 
 type CreateOrderInput struct {
+	BuyerID         string
 	CustomerName    string
 	CustomerPhone   string
 	CustomerEmail   string
@@ -188,6 +189,7 @@ func (s *OrderService) Create(ctx context.Context, sellerID string, in CreateOrd
 	now := time.Now().UTC()
 	order := &models.Order{
 		SellerID:        sellerID,
+		BuyerID:         in.BuyerID,
 		CustomerName:    strings.TrimSpace(in.CustomerName),
 		CustomerPhone:   strings.TrimSpace(in.CustomerPhone),
 		CustomerEmail:   strings.TrimSpace(in.CustomerEmail),

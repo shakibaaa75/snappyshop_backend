@@ -48,6 +48,7 @@ type OrderStatusEvent struct {
 
 // Order is stored in the "orders" collection.
 type Order struct {
+	BuyerID  string `bson:"buyerId,omitempty"`
 	ID       string `bson:"_id"` // UUIDv7 (time-ordered); orders before the change have 32-hex IDs
 	SellerID string `bson:"sellerId"`
 	// Number is the human-readable order number shown to customers and

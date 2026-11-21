@@ -38,11 +38,13 @@ type ProductAttribute struct {
 
 // Product is stored in the "products" collection. One document per product.
 type Product struct {
-	ID          string `bson:"_id"`
-	SellerID    string `bson:"sellerId"`
-	Name        string `bson:"name"`
-	Slug        string `bson:"slug"`
-	Description string `bson:"description"`
+	ReviewAverage float64 `bson:"reviewAverage,omitempty"`
+	ReviewCount   int     `bson:"reviewCount,omitempty"`
+	ID            string  `bson:"_id"`
+	SellerID      string  `bson:"sellerId"`
+	Name          string  `bson:"name"`
+	Slug          string  `bson:"slug"`
+	Description   string  `bson:"description"`
 
 	// Seller's own storefront categories. CategoryID/CategoryName hold the
 	// primary (first) one; CategoryIDs/CategoryNames hold all of them.
