@@ -164,6 +164,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Every new account gets an instant "Welcome" notification.
+	authSvc.SetWelcomeNotifier(mongorepo.NewNotifications(db))
 
 	// One SMTP config, shared by password reset and order emails.
 	smtpCfg := mailer.Config{
@@ -251,6 +253,8 @@ func run() error {
 		reviewGateway = sslcommerz.New(sslcommerz.Config{StoreID: gwStoreID, StorePassword: gwStorePass, Sandbox: gwSandbox})
 	}
 	frontendURL := envOr("FRONTEND_URL", "http://localhost:3000")
+	// Every new account also gets a welcome email (same SMTP as the other emails).
+	authSvc.SetWelcomeMailer(sender, frontendURL)
 	subscriptionSvc := service.NewSubscriptionService(
 		mongorepo.NewSubscriptions(db),
 		mongorepo.NewSubscriptionPayments(db),

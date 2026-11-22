@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -17,11 +18,13 @@ import (
 	"time"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/database"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
 	"shopbd/backend/internal/payment/sslcommerz"
+	"shopbd/backend/internal/storage"
 
 	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/bson"
@@ -30,10 +33,20 @@ import (
 	"golang.org/x/image/draw"
 )
 
+// PhotoStore is the part of *storage.R2 that review photos use.
+type PhotoStore interface {
+	PutObject(ctx context.Context, key, contentType string, body []byte) error
+	DeleteObject(ctx context.Context, key string) error
+	PublicURL(key string) string
+	KeyFromURL(u string) (string, bool)
+}
+
 type Reviews struct {
+	Cache   *cache.Cache
 	DB      *mongo.Database
 	Gateway *sslcommerz.Client
 	Log     *slog.Logger
+	Photos  PhotoStore // Cloudflare R2; nil = photos stay inline (local development only)
 }
 
 func (h Reviews) orders() *mongo.Collection  { return h.DB.Collection(database.OrdersCollection) }
@@ -77,40 +90,140 @@ type reviewInput struct {
 	Revision                             int64
 }
 
+func badPhotos() error {
+	return apperr.BadRequest("Use up to three JPEG or PNG images, each under 1 MB and 8 megapixels.")
+}
+
+// thumbnailPhoto validates one data-URL photo and returns it as a small JPEG.
+func thumbnailPhoto(v string) ([]byte, error) {
+	_, raw, ok := strings.Cut(v, ",")
+	if !ok {
+		return nil, badPhotos()
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil || len(data) > 1024*1024 {
+		return nil, badPhotos()
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || (format != "jpeg" && format != "png") || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > 8192 || cfg.Height > 8192 || int64(cfg.Width)*int64(cfg.Height) > 8000000 {
+		return nil, badPhotos()
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, badPhotos()
+	}
+	scale := math.Min(1, 480.0/float64(max(cfg.Width, cfg.Height)))
+	thumb := image.NewRGBA(image.Rect(0, 0, max(1, int(float64(cfg.Width)*scale)), max(1, int(float64(cfg.Height)*scale))))
+	draw.ApproxBiLinear.Scale(thumb, thumb.Bounds(), img, img.Bounds(), draw.Src, nil)
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 76}); err != nil {
+		return nil, badPhotos()
+	}
+	return buf.Bytes(), nil
+}
+
+// sanitizePhotos validates photos and returns them as inline data URLs.
+// Only used when R2 is not configured (see storePhotos).
 func sanitizePhotos(inputs []string) ([]string, error) {
 	out := []string{}
-	bad := apperr.BadRequest("Use up to three JPEG or PNG images, each under 1 MB and 8 megapixels.")
 	if len(inputs) > 3 {
-		return nil, bad
+		return nil, badPhotos()
 	}
 	for _, v := range inputs {
-		_, raw, ok := strings.Cut(v, ",")
-		if !ok {
-			return nil, bad
-		}
-		data, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil || len(data) > 1024*1024 {
-			return nil, bad
-		}
-		cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
-		if err != nil || (format != "jpeg" && format != "png") || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > 8192 || cfg.Height > 8192 || int64(cfg.Width)*int64(cfg.Height) > 8000000 {
-			return nil, bad
-		}
-		img, _, err := image.Decode(bytes.NewReader(data))
+		jpg, err := thumbnailPhoto(v)
 		if err != nil {
-			return nil, bad
+			return nil, err
 		}
-		scale := math.Min(1, 480.0/float64(max(cfg.Width, cfg.Height)))
-		thumb := image.NewRGBA(image.Rect(0, 0, max(1, int(float64(cfg.Width)*scale)), max(1, int(float64(cfg.Height)*scale))))
-		draw.ApproxBiLinear.Scale(thumb, thumb.Bounds(), img, img.Bounds(), draw.Src, nil)
-		var buf bytes.Buffer
-		if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 76}); err != nil {
-			return nil, bad
-		}
-		out = append(out, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(buf.Bytes()))
+		out = append(out, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(jpg))
 	}
 	return out, nil
 }
+
+// ownedPhotoKey returns the R2 key of a review photo URL that belongs to this buyer.
+func (h Reviews) ownedPhotoKey(owner, u string) (string, bool) {
+	key, ok := h.Photos.KeyFromURL(u)
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(key, "/")
+	if parts[0] != storage.ReviewPhotos.Folder || parts[1] != storage.OwnerSegment(owner) {
+		return "", false
+	}
+	return key, true
+}
+
+// storePhotos turns the submitted photos into public image URLs.
+//   - A new photo (a data URL) is validated, shrunk to a JPEG thumbnail and
+//     uploaded to Cloudflare R2. Only its URL goes into MongoDB.
+//   - A photo that is already one of this buyer's review photos in R2 (sent
+//     back unchanged when editing a review) is kept as it is.
+//
+// fresh lists the URLs uploaded by this call, so the caller can remove them
+// again if the review could not be saved.
+func (h Reviews) storePhotos(ctx context.Context, owner string, inputs []string) (urls, fresh []string, err error) {
+	if len(inputs) > 3 {
+		return nil, nil, badPhotos()
+	}
+	if h.Photos == nil {
+		urls, err = sanitizePhotos(inputs)
+		return urls, nil, err
+	}
+	urls = []string{}
+	for _, v := range inputs {
+		if !strings.HasPrefix(v, "data:") {
+			key, ok := h.ownedPhotoKey(owner, v)
+			if !ok {
+				h.deletePhotos(owner, fresh)
+				return nil, nil, badPhotos()
+			}
+			urls = append(urls, h.Photos.PublicURL(key))
+			continue
+		}
+		jpg, e := thumbnailPhoto(v)
+		var key string
+		if e == nil {
+			key, e = storage.BuildKey(storage.ReviewPhotos, owner, "jpg")
+		}
+		if e == nil {
+			pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			e = h.Photos.PutObject(pctx, key, "image/jpeg", jpg)
+			cancel()
+			if e != nil {
+				h.Log.Error("review photo: r2 put failed", "error", e.Error())
+				e = apperr.New(http.StatusBadGateway, "STORAGE_ERROR", "Could not store the photo, please try again")
+			}
+		}
+		if e != nil {
+			h.deletePhotos(owner, fresh)
+			return nil, nil, e
+		}
+		u := h.Photos.PublicURL(key)
+		urls = append(urls, u)
+		fresh = append(fresh, u)
+	}
+	return urls, fresh, nil
+}
+
+// deletePhotos removes this buyer's review photos from R2. It is best effort:
+// a failure is logged and never blocks the review. Anything that is not one of
+// the buyer's own review photos (old inline photos, other hosts) is skipped.
+func (h Reviews) deletePhotos(owner string, urls []string) {
+	if h.Photos == nil || len(urls) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, u := range urls {
+		key, ok := h.ownedPhotoKey(owner, u)
+		if !ok {
+			continue
+		}
+		if err := h.Photos.DeleteObject(ctx, key); err != nil {
+			h.Log.Error("review photo: r2 delete failed", "error", err.Error())
+		}
+	}
+}
+
 func (h Reviews) Save(w http.ResponseWriter, r *http.Request) {
 	var in reviewInput
 	if err := httpx.DecodeJSON(w, r, &in, 5<<20); err != nil {
@@ -141,7 +254,14 @@ func (h Reviews) Save(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.BadRequest("Choose the variant from your order."))
 		return
 	}
-	photos, err := sanitizePhotos(in.Photos)
+	// Photos on an edited review: remember the current ones so the ones the buyer
+	// removed can be deleted from R2 once the edit is saved.
+	var before struct{ Photos []string }
+	if in.Revision != 0 && h.Photos != nil {
+		_ = h.reviews().FindOne(r.Context(), bson.M{"_id": fmt.Sprintf("%x", sha256.Sum256([]byte(o.ID+"\x00"+in.Product))), "buyer": actor(r)}, options.FindOne().SetProjection(bson.M{"photos": 1})).Decode(&before)
+	}
+	// New photos go to Cloudflare R2; the review only keeps their URLs.
+	photos, fresh, err := h.storePhotos(r.Context(), actor(r), in.Photos)
 	if err != nil {
 		h.fail(w, r, err)
 		return
@@ -178,11 +298,58 @@ func (h Reviews) Save(w http.ResponseWriter, r *http.Request) {
 		err = apperr.Conflict("DUPLICATE_REVIEW", "This purchase already has a review. Open it to edit.", "order")
 	}
 	if err != nil {
+		h.deletePhotos(actor(r), fresh) // the review was not saved: do not leave the new photos in R2
 		h.fail(w, r, err)
 		return
 	}
+	kept := map[string]bool{}
+	for _, u := range photos {
+		kept[u] = true
+	}
+	removed := []string{}
+	for _, u := range before.Photos {
+		if !kept[u] {
+			removed = append(removed, u)
+		}
+	}
+	h.deletePhotos(actor(r), removed)
+	if in.Revision == 0 {
+		h.notifySeller(r.Context(), o.SellerID, line.Name, in.Rating, in.Title, moderation)
+	}
 	h.refreshAfterChange(r.Context(), in.Product)
 	w.WriteHeader(204)
+}
+
+// notifySeller puts a bell notification on the seller's dashboard when a buyer
+// writes a new review. It never fails the review: if it cannot be saved, the
+// review is still there.
+func (h Reviews) notifySeller(ctx context.Context, sellerID, product string, rating int, title, moderation string) {
+	if sellerID == "" {
+		return
+	}
+	link := ""
+	var shop struct{ Slug string }
+	if err := h.DB.Collection(database.StoreDesignsCollection).FindOne(ctx, bson.M{"sellerId": sellerID}, options.FindOne().SetProjection(bson.M{"slug": 1})).Decode(&shop); err == nil && shop.Slug != "" {
+		link = "/seller/" + shop.Slug + "/reviews"
+	}
+	body := fmt.Sprintf("A customer gave %d out of 5 stars: %s", rating, title)
+	if moderation == "pending" {
+		body += ". It will appear on your store after it is checked."
+	}
+	level := models.NotificationSuccess
+	if rating <= 2 {
+		level = models.NotificationWarning
+	}
+	n := models.Notification{
+		ID: models.NewID(), Title: "New review on " + product, Body: body, Level: level, LinkURL: link,
+		Audience: models.NotificationAudienceSelected, RecipientIDs: []string{sellerID},
+		CreatedBy: "system", CreatedAt: time.Now().UTC(),
+	}
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := h.DB.Collection(database.NotificationsCollection).InsertOne(bg, n); err != nil {
+		h.Log.Warn("review: seller notification failed", "seller", sellerID, "error", err.Error())
+	}
 }
 
 func (h Reviews) Purchases(w http.ResponseWriter, r *http.Request) {
@@ -322,16 +489,25 @@ func (h Reviews) list(w http.ResponseWriter, r *http.Request, scope string) {
 				return
 			}
 			m["seller"] = s.SellerID
-			m["hiddenInShop"] = bson.M{"$ne": true}
+			legacy := bson.M{"homepageFeatured": bson.M{"$exists": false}, "hiddenInShop": bson.M{"$ne": true}}
 			if ids := q.Get("ids"); ids != "" {
 				selected := strings.Split(ids, ",")
 				if len(selected) > 10 {
 					h.fail(w, r, apperr.BadRequest("Select up to ten featured reviews."))
 					return
 				}
-				m["_id"] = bson.M{"$in": selected}
+				legacy["_id"] = bson.M{"$in": selected}
 			} else {
-				m["featured"] = true
+				legacy["featured"] = true
+			}
+			if q.Get("selection") == "picked" {
+				if ids := q.Get("ids"); ids != "" {
+					m["_id"] = bson.M{"$in": strings.Split(ids, ",")}
+				} else {
+					m["_id"] = bson.M{"$in": bson.A{}}
+				}
+			} else {
+				m["$or"] = bson.A{bson.M{"homepageFeatured": true}, legacy}
 			}
 		} else if m["product"] == nil {
 			h.fail(w, r, apperr.BadRequest("Choose a product."))
@@ -359,7 +535,7 @@ func (h Reviews) list(w http.ResponseWriter, r *http.Request, scope string) {
 	page = max(0, min(page, 100000))
 	projection := publicReviewFields()
 	if scope != "public" {
-		for _, k := range []string{"order", "variantId", "revision", "featured", "reported", "hiddenInShop"} {
+		for _, k := range []string{"order", "variantId", "revision", "featured", "reported", "hiddenInShop", "homepageFeatured"} {
 			projection[k] = 1
 		}
 	}
@@ -444,7 +620,7 @@ func (h Reviews) action(w http.ResponseWriter, r *http.Request, admin bool) {
 				return
 			}
 			fields["reply"] = in.Text
-		case "feature":
+		case "feature", "show-home":
 			p := append(reviewPipeline(f), bson.M{"$match": bson.M{"status": "Published"}}, bson.M{"$project": bson.M{"_id": 1}})
 			cur, err := h.reviews().Aggregate(r.Context(), p)
 			if err != nil {
@@ -456,9 +632,15 @@ func (h Reviews) action(w http.ResponseWriter, r *http.Request, admin bool) {
 				h.fail(w, r, apperr.BadRequest("Only published reviews may be featured."))
 				return
 			}
-			fields["featured"] = true
-			fields["hiddenInShop"] = false
+			fields["homepageFeatured"] = true
+			if in.Action == "feature" {
+				fields["featured"] = true
+				fields["hiddenInShop"] = false
+			}
+		case "hide-home":
+			fields["homepageFeatured"] = false
 		case "unfeature":
+			fields["homepageFeatured"] = false
 			fields["featured"] = false
 			fields["hiddenInShop"] = true
 		case "report":

@@ -42,6 +42,11 @@ var Kinds = map[string]Kind{
 	"banner_video":   {Folder: "banner_video", Types: videoTypes, MaxBytes: 50 * mb},
 }
 
+// ReviewPhotos is where buyers' review photos are stored. It is not in Kinds on
+// purpose: review photos are uploaded through the review form (which shrinks
+// them to JPEG thumbnails), not through the seller/admin upload endpoint.
+var ReviewPhotos = Kind{Folder: "review_photos", Types: map[string]string{"image/jpeg": "jpg"}, MaxBytes: 1 * mb}
+
 // IsImage reports whether the kind holds images. Image kinds are uploaded
 // through the validating endpoint and always stored as WebP.
 func (k Kind) IsImage() bool { _, ok := k.Types["image/webp"]; return ok }

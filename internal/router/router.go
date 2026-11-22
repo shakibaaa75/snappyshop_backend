@@ -332,7 +332,10 @@ func New(d Deps) http.Handler {
 	// signed state cookie and the nonce in the ID token protect it instead.
 	r.Post(httpx.RefreshCookiePath+"/apple/callback", socialH.AppleCallback)
 
-	reviews := handler.Reviews{DB: d.Mongo, Gateway: d.ReviewGateway, Log: log}
+	reviews := handler.Reviews{DB: d.Mongo, Gateway: d.ReviewGateway, Log: log, Cache: d.Cache}
+	if d.Storage != nil {
+		reviews.Photos = d.Storage // review photos go to Cloudflare R2, not MongoDB
+	}
 	if d.Mongo != nil {
 		order.Reviews = &reviews
 	}
@@ -464,6 +467,13 @@ func New(d Deps) http.Handler {
 				b.Get("/profile", buyerH.Profile)
 				b.Put("/profile", buyerH.UpdateProfile)
 				b.Put("/preferences", buyerH.UpdatePreferences)
+				if notifH != nil {
+					// The buyer's bell (welcome message, ...). Same handlers as the seller's:
+					// the user always comes from the login, never from the request.
+					b.Get("/notifications", notifH.SellerList)
+					b.Post("/notifications/read-all", notifH.SellerMarkAllRead)
+					b.Post("/notifications/{id}/read", notifH.SellerMarkRead)
+				}
 
 				b.Get("/addresses", buyerH.Addresses)
 				b.Post("/addresses", buyerH.AddAddress)
@@ -495,6 +505,8 @@ func New(d Deps) http.Handler {
 
 			if d.Mongo != nil {
 				s.Get("/reviews", reviews.Seller)
+				s.Get("/reviews/settings", reviews.HomeSettings)
+				s.Put("/reviews/settings", reviews.SaveHomeSettings)
 				s.With(orderCreateLimit).Post("/reviews/{id}", reviews.SellerAction)
 			}
 			s.Get("/store-design", sd.GetDraft)

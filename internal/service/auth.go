@@ -9,12 +9,17 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"html"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 
 	"shopbd/backend/internal/apperr"
+	"shopbd/backend/internal/mailer"
 	"shopbd/backend/internal/models"
 	"shopbd/backend/internal/password"
 	"shopbd/backend/internal/repository"
@@ -56,6 +61,9 @@ type AuthService struct {
 	now       func() time.Time
 	dummyHash string
 	verifier  EmailVerifier
+	notifs    repository.NotificationRepository // nil = no welcome notification
+	mail      mailer.Mailer                     // nil = no welcome email
+	siteURL   string                            // public address of the website, for the email button
 }
 
 func NewAuthService(users repository.UserRepository, tokens repository.TokenRepository, hasher *password.Hasher, cfg AuthConfig) (*AuthService, error) {
@@ -74,6 +82,99 @@ func NewAuthService(users repository.UserRepository, tokens repository.TokenRepo
 // SetEmailVerifier turns on the "email must be verified" rule for sign-up.
 // Without it (as in most unit tests) registration does not check the email.
 func (s *AuthService) SetEmailVerifier(v EmailVerifier) { s.verifier = v }
+
+// SetWelcomeNotifier turns on the "Welcome" bell notification that every new
+// account (email sign-up or first Google/Apple sign-in) receives instantly.
+func (s *AuthService) SetWelcomeNotifier(n repository.NotificationRepository) { s.notifs = n }
+
+// SetWelcomeMailer turns on the welcome email for new accounts. siteURL is the
+// public address of the website (used for the button in the email).
+func (s *AuthService) SetWelcomeMailer(m mailer.Mailer, siteURL string) {
+	s.mail = m
+	s.siteURL = strings.TrimRight(strings.TrimSpace(siteURL), "/")
+}
+
+// sendWelcome gives a brand-new account its welcome notification and its
+// welcome email. Neither can fail the sign-up: the account already exists, so
+// a problem is only logged. The email is sent in the background.
+func (s *AuthService) sendWelcome(ctx context.Context, u *models.User) {
+	first := ""
+	if f := strings.Fields(u.Name); len(f) > 0 {
+		first = f[0]
+	}
+	if r := []rune(first); len(r) > 40 {
+		first = string(r[:40])
+	}
+	seller := u.Role == models.RoleSeller
+
+	if s.notifs != nil {
+		title, body := "Welcome to ShopBD!", "Your account is ready. Browse stores, place orders and track them from My orders. Once an order is delivered you can leave a review."
+		if seller {
+			body = "Your seller account is ready. Set up your store, add your products and start selling. We will notify you here when you get orders and reviews."
+		}
+		if first != "" {
+			title = "Welcome to ShopBD, " + first + "!"
+		}
+		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		err := s.notifs.Create(bg, &models.Notification{
+			ID: models.NewID(), Title: title, Body: body, Level: models.NotificationSuccess,
+			Audience: models.NotificationAudienceSelected, RecipientIDs: []string{u.ID},
+			CreatedBy: systemSender, CreatedAt: u.CreatedAt,
+		})
+		cancel()
+		if err != nil {
+			slog.Warn("welcome notification failed", "userId", u.ID, "error", err.Error())
+		}
+	}
+
+	if s.mail != nil && u.Email != "" {
+		subject, htmlBody, textBody := welcomeEmail(first, seller, s.siteURL)
+		to, id := u.Email, u.ID
+		go func() {
+			mctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := s.mail.Send(mctx, to, subject, htmlBody, textBody); err != nil {
+				slog.Warn("welcome email failed", "userId", id, "error", err.Error())
+			}
+		}()
+	}
+}
+
+// welcomeEmail builds the welcome message (HTML + plain text).
+func welcomeEmail(first string, seller bool, siteURL string) (subject, htmlBody, textBody string) {
+	hello := "Hi there,"
+	if first != "" {
+		hello = "Hi " + first + ","
+	}
+	intro := "Thanks for joining ShopBD. Your account is ready: browse stores, place orders and track every delivery from My orders. After an order arrives you can leave a review to help other shoppers."
+	button, link := "Start shopping", siteURL
+	if seller {
+		intro = "Thanks for joining ShopBD as a seller. Your account is ready: add your products, design your store and start selling. We will let you know as soon as you get your first order or review."
+		button, link = "Open your dashboard", ""
+		if siteURL != "" {
+			link = siteURL + "/seller/dashboard"
+		}
+	}
+	subject = "Welcome to ShopBD"
+
+	textBody = hello + "\r\n\r\n" + intro + "\r\n\r\n"
+	if link != "" {
+		textBody += button + ": " + link + "\r\n\r\n"
+	}
+	textBody += "— ShopBD"
+
+	btn := ""
+	if link != "" {
+		btn = fmt.Sprintf(`<p style="margin:24px 0 0"><a href="%s" style="display:inline-block;background:#0C68F6;color:#ffffff;text-decoration:none;font-size:14px;font-weight:bold;padding:12px 22px;border-radius:999px">%s</a></p>`, html.EscapeString(link), button)
+	}
+	htmlBody = fmt.Sprintf(`<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#17233a">
+<h1 style="font-size:22px;margin:0 0 12px">Welcome to ShopBD</h1>
+<p style="font-size:15px;line-height:1.6;margin:0 0 12px">%s</p>
+<p style="font-size:15px;line-height:1.6;margin:0">%s</p>%s
+<p style="font-size:12px;color:#8a94a6;margin:28px 0 0">You are receiving this email because you created a ShopBD account. Please do not reply to this message.</p>
+</div>`, html.EscapeString(hello), html.EscapeString(intro), btn)
+	return subject, htmlBody, textBody
+}
 
 // WithClock replaces the time source (tests only).
 func (s *AuthService) WithClock(now func() time.Time) *AuthService {
@@ -117,6 +218,7 @@ func (s *AuthService) Register(ctx context.Context, in validation.RegisterInput)
 		}
 		return nil, nil, err
 	}
+	s.sendWelcome(ctx, u)
 	pair, err := s.issueTokens(ctx, u, models.NewID(), models.NewID())
 	if err != nil {
 		return nil, nil, err

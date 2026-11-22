@@ -200,6 +200,7 @@ func (s *AuthService) firstSocialLogin(ctx context.Context, p SocialProfile) (*m
 		}
 		return nil, err
 	}
+	s.sendWelcome(ctx, u)
 	return u, nil
 }
 

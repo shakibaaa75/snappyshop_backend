@@ -32,6 +32,7 @@ type storeDesignDoc struct {
 	SlugChangedAt *time.Time `bson:"slugChangedAt,omitempty"`
 	StoreName     string     `bson:"storeName,omitempty"`
 	NameChanges   int        `bson:"nameChangeCount,omitempty"`
+	ReviewDisplay bson.M     `bson:"reviewDisplay,omitempty"`
 	Draft         bson.Raw   `bson:"draft"`
 	Published     bson.Raw   `bson:"published,omitempty"`
 	IsPublished   bool       `bson:"isPublished"`
@@ -54,6 +55,21 @@ func rawToMap(raw bson.Raw) (map[string]any, error) {
 	return m, nil
 }
 
+// Older editors stored review settings outside the design. Once a draft or
+// published design has its own Reviews section, its settings travel with it.
+func applyLegacyReviewDisplay(design map[string]any, display bson.M) {
+	sections, _ := design["sections"].([]any)
+	for _, raw := range sections {
+		section, _ := raw.(map[string]any)
+		if section["id"] == "reviews" {
+			return
+		}
+	}
+	for key, value := range display {
+		design[key] = value
+	}
+}
+
 func (d *storeDesignDoc) toModel() (*models.StoreDesign, error) {
 	out := &models.StoreDesign{
 		ID:              d.ID,
@@ -72,6 +88,7 @@ func (d *storeDesignDoc) toModel() (*models.StoreDesign, error) {
 		return nil, err
 	}
 	if draft != nil {
+		applyLegacyReviewDisplay(draft, d.ReviewDisplay)
 		out.Draft = draft
 	}
 	published, err := rawToMap(d.Published)
@@ -79,6 +96,7 @@ func (d *storeDesignDoc) toModel() (*models.StoreDesign, error) {
 		return nil, err
 	}
 	if published != nil {
+		applyLegacyReviewDisplay(published, d.ReviewDisplay)
 		out.Published = published
 	}
 	// Documents created before the name was stored at document level: fall

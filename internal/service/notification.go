@@ -268,7 +268,20 @@ func (s *NotificationService) visible(ctx context.Context, sellerID string) ([]*
 		}
 		return nil, err
 	}
-	return s.repo.ListForSeller(ctx, sellerID, u.CreatedAt, s.now().UTC(), notificationSellerWindow)
+	list, err := s.repo.ListForSeller(ctx, sellerID, u.CreatedAt, s.now().UTC(), notificationSellerWindow)
+	if err != nil || u.Role == models.RoleSeller {
+		return list, err
+	}
+	// Buyers read this list too (welcome message, ...). "All sellers" messages
+	// from an admin are for sellers only, so only notifications addressed to
+	// this user by name are kept.
+	own := make([]*models.Notification, 0, len(list))
+	for _, n := range list {
+		if n.Audience != models.NotificationAudienceAll {
+			own = append(own, n)
+		}
+	}
+	return own, nil
 }
 
 // -------------------------------------------------------------- helpers
