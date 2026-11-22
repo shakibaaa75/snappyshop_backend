@@ -17,6 +17,7 @@ import (
 	"shopbd/backend/internal/courierconn"
 	"shopbd/backend/internal/handler"
 	"shopbd/backend/internal/httpx"
+	"shopbd/backend/internal/mailer"
 	"shopbd/backend/internal/metrics"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
@@ -102,6 +103,7 @@ type Deps struct {
 	FraudAdmin         *service.FraudSettingsService     // nil = fraud settings (admin) off
 	FraudCheck         *service.FraudCheckService        // nil = seller fraud check off
 	AdminAuth          *service.AdminAuthService
+	MailSender         mailer.Mailer
 	Notifications      *service.NotificationService // nil = admin-to-seller notifications switched off
 	Buyer              *service.BuyerService        // nil = buyer profile area switched off
 	BuyerOrders        *service.BuyerOrderService   // nil = buyer "My orders" switched off
@@ -347,6 +349,18 @@ func New(d Deps) http.Handler {
 
 	r.Route(httpx.APIPrefix, func(api chi.Router) {
 		api.Use(middleware.CSRFWith(cfg.CORSOrigins, customOrigin, log))
+
+		if d.Mongo != nil {
+			support := &handler.Support{DB: d.Mongo, Mail: d.MailSender}
+			api.With(authLimit("support-create", LimitSpec{Every: 30 * time.Second, Burst: 3}), middleware.OptionalCheckoutAuth(d.Auth, log)).Post("/support/tickets", support.Create)
+			api.With(authLimit("contact-create", LimitSpec{Every: 30 * time.Second, Burst: 3}), middleware.OptionalCheckoutAuth(d.Auth, log)).Post("/contact/messages", support.Contact)
+			api.Group(func(sr chi.Router) {
+				sr.Use(middleware.Authenticate(d.Auth, log))
+				sr.Get("/support/tickets", func(w http.ResponseWriter, r *http.Request) { support.List(w, r, false) })
+				sr.Get("/support/tickets/{id}", func(w http.ResponseWriter, r *http.Request) { support.Detail(w, r, false) })
+				sr.Post("/support/tickets/{id}/reply", func(w http.ResponseWriter, r *http.Request) { support.Reply(w, r, false) })
+			})
+		}
 
 		api.Route("/auth", func(a chi.Router) {
 			a.Use(middleware.NoStore)
@@ -662,6 +676,13 @@ func New(d Deps) http.Handler {
 					ar.Use(middleware.RequireRole(log, models.RoleAdmin))
 
 					if d.Mongo != nil {
+						support := &handler.Support{DB: d.Mongo, Mail: d.MailSender}
+						ar.Get("/contact/messages", support.Contacts)
+						ar.Post("/contact/messages/{id}/reply", support.ReplyContact)
+						ar.Get("/support/tickets", func(w http.ResponseWriter, r *http.Request) { support.List(w, r, true) })
+						ar.Get("/support/tickets/{id}", func(w http.ResponseWriter, r *http.Request) { support.Detail(w, r, true) })
+						ar.Post("/support/tickets/{id}/reply", func(w http.ResponseWriter, r *http.Request) { support.Reply(w, r, true) })
+						ar.Patch("/support/tickets/{id}", support.Update)
 						ar.Get("/reviews", reviews.Admin)
 						ar.Post("/review-order-evidence", reviews.RecordOrderEvidence)
 						ar.Post("/reviews/{id}", reviews.Moderate)

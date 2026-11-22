@@ -721,6 +721,7 @@ func run() error {
 			FraudCheck:         fraudCheckSvc,
 			AdminAuth:          adminAuthSvc,
 			Notifications:      notificationSvc,
+			MailSender:         sender,
 			Buyer:              buyerSvc,
 			BuyerOrders:        buyerOrderSvc,
 			Couriers:           courierSvc,
