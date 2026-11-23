@@ -69,6 +69,7 @@ const marketplaceTimeout = 8 * time.Second
 /* ------------------------------------------------------------------ */
 
 type mkSellerDTO struct {
+	SellingCategory string  `json:"sellingCategory,omitempty"`
 	ID              string  `json:"id"`
 	Slug            string  `json:"slug"`
 	Name            string  `json:"name"`
@@ -120,20 +121,22 @@ type mkCategoryDTO struct {
 
 // storeInfo is the public identity of one seller's published store.
 type storeInfo struct {
-	SellerID    string
-	Slug        string
-	Name        string
-	LogoURL     string
-	BannerURL   string
-	Description string
+	SellingCategory string
+	SellerID        string
+	Slug            string
+	Name            string
+	LogoURL         string
+	BannerURL       string
+	Description     string
 }
 
 // publishedFields are the public fields read from a published store design.
 type publishedFields struct {
-	StoreName   string `bson:"storeName"`
-	LogoURL     string `bson:"logoUrl"`
-	CoverURL    string `bson:"coverUrl"`
-	Description string `bson:"description"`
+	SellingCategory string `bson:"sellingCategory"`
+	StoreName       string `bson:"storeName"`
+	LogoURL         string `bson:"logoUrl"`
+	CoverURL        string `bson:"coverUrl"`
+	Description     string `bson:"description"`
 }
 
 type storeDesignRow struct {
@@ -188,6 +191,7 @@ func (h *MarketplaceHandler) stores(ctx context.Context) (map[string]*storeInfo,
 				info.LogoURL = pub.LogoURL
 				info.BannerURL = pub.CoverURL
 				info.Description = pub.Description
+				info.SellingCategory = strings.ToLower(strings.TrimSpace(pub.SellingCategory))
 			}
 		}
 		out[row.SellerID] = info
@@ -385,6 +389,7 @@ func (h *MarketplaceHandler) matchesCategory(p *models.Product, cats map[string]
 
 func sellerDTO(s *storeInfo, productCount, completed int) mkSellerDTO {
 	return mkSellerDTO{
+		SellingCategory: s.SellingCategory,
 		ID:              s.SellerID,
 		Slug:            s.Slug,
 		Name:            s.Name,
@@ -552,6 +557,7 @@ func (h *MarketplaceHandler) Products(w http.ResponseWriter, r *http.Request) {
 // ?category=<slug> keeps only sellers that have at least one active product
 // in that category.
 func (h *MarketplaceHandler) Sellers(w http.ResponseWriter, r *http.Request) {
+	sellingCategory := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("sellingCategory")))
 	page := intParam(r, "page", 1, 1, 10000)
 	limit := intParam(r, "limit", 12, 1, 60)
 	categoryFilter := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("category")))
@@ -576,6 +582,9 @@ func (h *MarketplaceHandler) Sellers(w http.ResponseWriter, r *http.Request) {
 
 	list := make([]mkSellerDTO, 0, len(stores))
 	for _, s := range stores {
+		if sellingCategory != "" && s.SellingCategory != sellingCategory {
+			continue
+		}
 		if inCategory != nil && !inCategory[s.SellerID] {
 			continue
 		}
@@ -590,7 +599,10 @@ func (h *MarketplaceHandler) Sellers(w http.ResponseWriter, r *http.Request) {
 		if a.ProductCount != b.ProductCount {
 			return a.ProductCount > b.ProductCount
 		}
-		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+		if an, bn := strings.ToLower(a.Name), strings.ToLower(b.Name); an != bn {
+			return an < bn
+		}
+		return a.ID < b.ID
 	})
 
 	setPublicCache(w)
