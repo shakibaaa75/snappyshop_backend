@@ -135,6 +135,7 @@ type OrderLineInput struct {
 }
 
 type CreateOrderInput struct {
+	ActorSellerID   string // authenticated seller placing the order, if any
 	BuyerID         string
 	CustomerName    string
 	CustomerPhone   string
@@ -162,11 +163,18 @@ func (s *OrderService) CreateBySlug(ctx context.Context, slug string, in CreateO
 	if sellerID == "" {
 		return nil, apperr.NotFound()
 	}
+	// Never allow the owner of this store to order their own products.
+	if in.ActorSellerID != "" && in.ActorSellerID == sellerID {
+		return nil, apperr.Forbidden("You cannot purchase products from your own store")
+	}
 	return s.Create(ctx, sellerID, in)
 }
 
 // Create validates and stores an order for a seller.
 func (s *OrderService) Create(ctx context.Context, sellerID string, in CreateOrderInput) (*models.Order, error) {
+	if in.ActorSellerID != "" && in.ActorSellerID == sellerID {
+		return nil, apperr.Forbidden("You cannot purchase products from your own store")
+	}
 	if err := validateOrderInput(in); err != nil {
 		return nil, err
 	}

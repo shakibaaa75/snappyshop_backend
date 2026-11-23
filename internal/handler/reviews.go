@@ -254,6 +254,12 @@ func (h Reviews) Save(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.BadRequest("Choose the variant from your order."))
 		return
 	}
+	// A verified purchase alone is not enough: the order must be delivered.
+	// Enforce this on the API so clients cannot bypass the review form.
+	if o.Status != "delivered" {
+		h.fail(w, r, apperr.BadRequest("You can review this product only after your order has been delivered."))
+		return
+	}
 	// Photos on an edited review: remember the current ones so the ones the buyer
 	// removed can be deleted from R2 once the edit is saved.
 	var before struct{ Photos []string }

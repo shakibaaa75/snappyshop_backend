@@ -218,11 +218,17 @@ func (h *OrderHandler) Create(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	buyerID := ""
-	if c, ok := middleware.ClaimsFrom(r.Context()); ok && c.Role == models.RoleBuyer {
-		buyerID = c.UserID
+	actorSellerID := ""
+	if c, ok := middleware.ClaimsFrom(r.Context()); ok {
+		if c.Role == models.RoleBuyer {
+			buyerID = c.UserID
+		} else if c.Role == models.RoleSeller {
+			actorSellerID = c.UserID
+		}
 	}
 	order, err := h.Svc.CreateBySlug(r.Context(), slug, service.CreateOrderInput{
 		BuyerID:         buyerID,
+		ActorSellerID:   actorSellerID,
 		CustomerName:    body.CustomerName,
 		CustomerPhone:   body.CustomerPhone,
 		CustomerEmail:   body.CustomerEmail,
