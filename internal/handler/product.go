@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -15,6 +16,7 @@ import (
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
 	"shopbd/backend/internal/models"
+	"shopbd/backend/internal/revalidate"
 	"shopbd/backend/internal/service"
 )
 
@@ -26,6 +28,27 @@ type ProductHandler struct {
 	// Cache is the shared read-through cache (Redis). Nil means the public
 	// product list always reads MongoDB, exactly as before.
 	Cache *cache.Cache
+
+	// Revalidate tells the Next.js storefront to refresh a store at once.
+	// Nil = Next refreshes on its own timer only.
+	Revalidate *revalidate.Client
+}
+
+// productChanged clears the cached public data of one seller and tells Next to
+// refresh that store. The address lookup runs in the background so the
+// seller's save is not slowed down.
+func (h *ProductHandler) productChanged(sellerID string) {
+	invalidateSellerStorefront(h.Cache, sellerID)
+	if h.Revalidate == nil || h.StoreDesign == nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if slug, err := h.StoreDesign.CurrentSlugBySeller(ctx, sellerID); err == nil {
+			h.Revalidate.Notify(slug)
+		}
+	}()
 }
 
 // storefrontSellerTag is the cache version tag for everything public that
@@ -407,7 +430,7 @@ func (h *ProductHandler) Create(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	invalidateSellerStorefront(h.Cache, claims.UserID)
+	h.productChanged(claims.UserID)
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"product": toProductDTO(p)})
 }
 
@@ -429,7 +452,7 @@ func (h *ProductHandler) Update(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	invalidateSellerStorefront(h.Cache, claims.UserID)
+	h.productChanged(claims.UserID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"product": toProductDTO(p)})
 }
 
@@ -445,25 +468,61 @@ func (h *ProductHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	invalidateSellerStorefront(h.Cache, claims.UserID)
+	h.productChanged(claims.UserID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// PublicList — GET /api/v1/store/{slug}/products (public, no auth)
+// Paging limits for the public product list. With no query the first 200
+// products are returned, as before; "hasMore" tells the client to ask for the
+// next page.
+const (
+	publicProductsDefaultLimit = 200
+	publicProductsMaxLimit     = 200
+	publicProductsMaxPage      = 1000
+)
+
+// publicProductsPage is what is cached for one page of one seller's list.
+type publicProductsPage struct {
+	Products []ProductDTO `json:"products"`
+	HasMore  bool         `json:"hasMore"`
+}
+
+// parsePaging reads ?page= (1-based) and ?limit=. Bad or missing values fall
+// back to page 1 and the default limit instead of failing the request.
+func parsePaging(r *http.Request) (page, limit int) {
+	page, limit = 1, publicProductsDefaultLimit
+	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v >= 1 {
+		page = v
+	}
+	if page > publicProductsMaxPage {
+		page = publicProductsMaxPage
+	}
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v >= 1 {
+		limit = v
+	}
+	if limit > publicProductsMaxLimit {
+		limit = publicProductsMaxLimit
+	}
+	return page, limit
+}
+
+// PublicList — GET /api/v1/store/{slug}/products?page=1&limit=48 (public, no auth)
 //
 // The slug is resolved through the shared cache (tag "slugs", invalidated on
-// every shop name/URL change, publish and visibility change), so a retired or
-// unpublished store URL answers 404 at once on every instance. The product list
-// of that seller is cached under its own tag. Both are the same for every
-// visitor, so sharing them cannot leak per-user data. The
-// list is the same for every visitor, so sharing it cannot leak per-user data.
-// Checkout never uses it: orders read prices and stock from MongoDB.
+// every shop name/URL change, first publish and visibility change), so a
+// retired or unpublished store URL answers 404 at once on every instance. Each
+// page of that seller's product list is cached under the seller's own tag. All
+// of it is the same for every visitor, so sharing it cannot leak per-user
+// data. Checkout never uses it: orders read prices and stock from MongoDB.
+//
+// Response: {"products": [...], "page": 1, "limit": 48, "hasMore": true}.
 func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	if slug == "" {
 		h.fail(w, r, apperr.BadRequest("Missing slug"))
 		return
 	}
+	page, limit := parsePaging(r)
 	sellerID, err := cachedSellerID(r.Context(), h.Cache, h.StoreDesign, slug)
 	if err != nil {
 		if errors.Is(err, cache.ErrBusy) {
@@ -479,7 +538,7 @@ func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.NotFound())
 		return
 	}
-	out, err := h.publicProducts(r.Context(), sellerID)
+	out, err := h.publicProducts(r.Context(), sellerID, page, limit)
 	if err != nil {
 		if errors.Is(err, cache.ErrBusy) {
 			// Too many concurrent loads on this instance: shed load instead
@@ -492,36 +551,41 @@ func (h *ProductHandler) PublicList(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"products": out})
+	writeCachedJSON(w, r, map[string]any{
+		"products": out.Products,
+		"page":     page,
+		"limit":    limit,
+		"hasMore":  out.HasMore,
+	})
 }
 
-// publicProducts returns the public product DTOs of one seller, through the
-// shared cache when it is configured.
-func (h *ProductHandler) publicProducts(ctx context.Context, sellerID string) ([]ProductDTO, error) {
-	load := func(ctx context.Context) ([]ProductDTO, error) {
-		items, err := h.Svc.ListPublic(ctx, sellerID)
+// publicProducts returns one page of the public product DTOs of one seller,
+// through the shared cache when it is configured.
+func (h *ProductHandler) publicProducts(ctx context.Context, sellerID string, page, limit int) (publicProductsPage, error) {
+	load := func(ctx context.Context) (publicProductsPage, error) {
+		items, more, err := h.Svc.ListPublicPage(ctx, sellerID, page, limit)
 		if err != nil {
-			return nil, err
+			return publicProductsPage{}, err
 		}
-		out := make([]ProductDTO, 0, len(items))
+		out := make([]ProductDTO, 0, len(items)) // never null in JSON
 		for _, p := range items {
 			out = append(out, toProductDTO(p))
 		}
-		return out, nil
+		return publicProductsPage{Products: out, HasMore: more}, nil
 	}
 	if h.Cache == nil {
 		return load(ctx)
 	}
-	key, kerr := cache.ScopedKey(sellerID, "public-products")
+	key, kerr := cache.ScopedKey(sellerID, "public-products", "p"+strconv.Itoa(page), "l"+strconv.Itoa(limit))
 	if kerr != nil {
 		return load(ctx) // unusual seller id: skip the cache, never fail
 	}
 	out, err := cache.Get(ctx, h.Cache, "product", key, storefrontSellerTag(sellerID), load)
 	if err != nil {
-		return nil, err
+		return publicProductsPage{}, err
 	}
-	if out == nil {
-		out = []ProductDTO{} // keep "products": [] and never null
+	if out.Products == nil {
+		out.Products = []ProductDTO{} // keep "products": [] and never null
 	}
 	return out, nil
 }

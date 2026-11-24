@@ -176,6 +176,9 @@ type ProductRepository interface {
 	FindBySlug(ctx context.Context, sellerID, slug string) (*models.Product, error)
 	List(ctx context.Context, sellerID string, limit int) ([]*models.Product, error)
 	ListPublic(ctx context.Context, sellerID string, limit int) ([]*models.Product, error)
+	// ListPublicPage returns one page of active products (newest first) and
+	// whether more exist after it. skip >= 0, 1 <= limit <= 200.
+	ListPublicPage(ctx context.Context, sellerID string, skip, limit int) (items []*models.Product, hasMore bool, err error)
 	Update(ctx context.Context, sellerID, id string, p *models.Product) error
 	Delete(ctx context.Context, sellerID, id string) error
 }

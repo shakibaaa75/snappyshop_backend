@@ -47,6 +47,10 @@ type Reviews struct {
 	Gateway *sslcommerz.Client
 	Log     *slog.Logger
 	Photos  PhotoStore // Cloudflare R2; nil = photos stay inline (local development only)
+
+	// StoreChanged runs after a change that shows on one store's public page
+	// (the router uses it to refresh the Next.js copy). Nil = nothing extra.
+	StoreChanged func(sellerID string)
 }
 
 func (h Reviews) orders() *mongo.Collection  { return h.DB.Collection(database.OrdersCollection) }

@@ -527,6 +527,18 @@ func (s *ProductService) ListPublic(ctx context.Context, sellerID string) ([]*mo
 	return s.repo.ListPublic(ctx, sellerID, 200)
 }
 
+// ListPublicPage returns one page of the public product list (1-based page)
+// and whether another page follows.
+func (s *ProductService) ListPublicPage(ctx context.Context, sellerID string, page, limit int) ([]*models.Product, bool, error) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 200 {
+		limit = 200
+	}
+	return s.repo.ListPublicPage(ctx, sellerID, (page-1)*limit, limit)
+}
+
 // ---------- Helpers ----------
 
 func buildOptions(in []OptionInput) []models.ProductOption {

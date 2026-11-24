@@ -91,6 +91,11 @@ func (h Reviews) SaveHomeSettings(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, err)
 		return
 	}
-	invalidateSlugs(h.Cache)
+	// Only this store's public page shows these settings, so only this
+	// store's cache is cleared (not every store's).
+	invalidateStoreDesign(h.Cache, actor(r))
+	if h.StoreChanged != nil {
+		h.StoreChanged(actor(r))
+	}
 	httpx.WriteJSON(w, 200, display)
 }

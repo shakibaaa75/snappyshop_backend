@@ -31,6 +31,7 @@ import (
 	"shopbd/backend/internal/password"
 	"shopbd/backend/internal/payment/sslcommerz"
 	"shopbd/backend/internal/repository/mongorepo"
+	"shopbd/backend/internal/revalidate"
 	"shopbd/backend/internal/router"
 	"shopbd/backend/internal/secretbox"
 	"shopbd/backend/internal/service"
@@ -253,6 +254,12 @@ func run() error {
 		reviewGateway = sslcommerz.New(sslcommerz.Config{StoreID: gwStoreID, StorePassword: gwStorePass, Sandbox: gwSandbox})
 	}
 	frontendURL := envOr("FRONTEND_URL", "http://localhost:3000")
+	// Tells the Next.js storefront to refresh a store right after a publish or
+	// product change. Off until REVALIDATE_SECRET is set (same value as in the
+	// Next.js app). NEXT_INTERNAL_URL is where this API reaches Next; it
+	// defaults to FRONTEND_URL.
+	revalidateClient := revalidate.New(envOr("NEXT_INTERNAL_URL", frontendURL), os.Getenv("REVALIDATE_SECRET"), log)
+	revalidateClient.Start(ctx)
 	// Every new account also gets a welcome email (same SMTP as the other emails).
 	authSvc.SetWelcomeMailer(sender, frontendURL)
 	subscriptionSvc := service.NewSubscriptionService(
@@ -728,6 +735,7 @@ func run() error {
 			Shipping:           shippingSvc,
 			ProviderName:       providerName,
 			FrontendURL:        frontendURL,
+			Revalidate:         revalidateClient,
 			SocialGoogle:       socialGoogle,
 			SocialApple:        socialApple,
 			Storage:            r2,

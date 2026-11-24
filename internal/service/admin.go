@@ -30,7 +30,7 @@ type AdminService struct {
 	grantOffers   *SubscriptionGrantService // set with SetGrantOffers; free plans are offered, then claimed
 
 	mu                 sync.RWMutex
-	onVisibilityChange func()
+	onVisibilityChange func(sellerID string)
 }
 
 func NewAdminService(
@@ -58,18 +58,18 @@ func NewAdminService(
 // account status changed (suspend, restrict, ban, restore). The router uses it
 // to drop the public marketplace cache, so a suspended or banned seller
 // disappears from the marketplace at once instead of when the cache expires.
-func (s *AdminService) SetOnVisibilityChange(fn func()) {
+func (s *AdminService) SetOnVisibilityChange(fn func(sellerID string)) {
 	s.mu.Lock()
 	s.onVisibilityChange = fn
 	s.mu.Unlock()
 }
 
-func (s *AdminService) visibilityChanged() {
+func (s *AdminService) visibilityChanged(sellerID string) {
 	s.mu.RLock()
 	fn := s.onVisibilityChange
 	s.mu.RUnlock()
 	if fn != nil {
-		fn()
+		fn(sellerID)
 	}
 }
 
@@ -186,7 +186,7 @@ func (s *AdminService) RestrictSeller(ctx context.Context, sellerID string, in R
 	if s.tokens != nil {
 		_ = s.tokens.RevokeAllForUser(ctx, sellerID, now)
 	}
-	s.visibilityChanged()
+	s.visibilityChanged(sellerID)
 	s.recordLog(ctx, in.AdminID, "seller."+kind, "seller", sellerID, reason, string(prevStatus), string(newStatus), in.IP)
 	return nil
 }
@@ -218,7 +218,7 @@ func (s *AdminService) RestoreSeller(ctx context.Context, sellerID, reason, admi
 	if err := s.users.UpdateStatus(ctx, sellerID, models.StatusActive); err != nil {
 		return err
 	}
-	s.visibilityChanged()
+	s.visibilityChanged(sellerID)
 	s.recordLog(ctx, adminID, "seller.restore", "seller", sellerID, reason, string(prev), string(models.StatusActive), ip)
 	return nil
 }

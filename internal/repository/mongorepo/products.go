@@ -114,6 +114,42 @@ func (r *Products) ListPublic(ctx context.Context, sellerID string, limit int) (
 	return out, nil
 }
 
+// ListPublicPage returns one page of a seller's active products, newest first,
+// and whether another page follows. It asks for one extra row to know that,
+// so no separate count query is needed. _id breaks ties so pages never repeat
+// or skip a product when several share the same createdAt.
+func (r *Products) ListPublicPage(ctx context.Context, sellerID string, skip, limit int) ([]*models.Product, bool, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	if skip < 0 {
+		skip = 0
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "createdAt", Value: -1}, {Key: "_id", Value: -1}}).
+		SetSkip(int64(skip)).
+		SetLimit(int64(limit) + 1)
+	cur, err := r.col.Find(ctx, bson.D{
+		{Key: "sellerId", Value: sellerID},
+		{Key: "isActive", Value: true},
+	}, opts)
+	if err != nil {
+		return nil, false, err
+	}
+	defer cur.Close(ctx)
+	var out []*models.Product
+	if err := cur.All(ctx, &out); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(out) > limit
+	if hasMore {
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
 func (r *Products) Update(ctx context.Context, sellerID, id string, p *models.Product) error {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

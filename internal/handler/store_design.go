@@ -14,6 +14,7 @@ import (
 	"shopbd/backend/internal/cache"
 	"shopbd/backend/internal/httpx"
 	"shopbd/backend/internal/middleware"
+	"shopbd/backend/internal/revalidate"
 	"shopbd/backend/internal/service"
 )
 
@@ -24,12 +25,21 @@ type StoreDesignHandler struct {
 	// Cache is the shared cache (Redis). Nil = every public request reads
 	// MongoDB, exactly as before.
 	Cache *cache.Cache
+
+	// Revalidate tells the Next.js storefront to refresh given stores at
+	// once. Nil = Next refreshes on its own timer only.
+	Revalidate *revalidate.Client
 }
 
-// InvalidateIdentity drops the cached slug lookups and public store designs on
-// every API instance. The router calls it when a shop name/URL changes or an
-// admin changes a seller's visibility.
-func (h *StoreDesignHandler) InvalidateIdentity() { invalidateSlugs(h.Cache) }
+// InvalidateIdentity drops the cached slug lookups on every API instance and
+// the cached design of the one store involved. The router calls it when a shop
+// name/URL changes or an admin changes a seller's visibility. Old and new
+// addresses are sent to Next so the retired address stops being served.
+func (h *StoreDesignHandler) InvalidateIdentity(sellerID string, slugs ...string) {
+	invalidateSlugs(h.Cache)
+	invalidateStoreDesign(h.Cache, sellerID)
+	h.Revalidate.Notify(slugs...)
+}
 
 type designBody struct {
 	Design map[string]any `json:"design"`
@@ -132,11 +142,25 @@ func (h *StoreDesignHandler) Publish(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, r, apperr.BadRequest("Missing design"))
 		return
 	}
+	// Is this the first publish? Then a cached "not found" for the address
+	// must go too, so the new store never shows a 404. Unknown means yes.
+	firstPublish := true
+	if slug, err := h.Svc.CurrentSlugBySeller(r.Context(), claims.UserID); err == nil && slug != "" {
+		if id, err := h.Svc.SellerIDBySlug(r.Context(), slug); err == nil && id != "" {
+			firstPublish = false
+		}
+	}
 	if err := h.Svc.Publish(r.Context(), claims.UserID, body.Design); err != nil {
 		h.fail(w, r, err)
 		return
 	}
-	invalidateSlugs(h.Cache) // the public design (and a first publish) changed
+	if firstPublish {
+		invalidateSlugs(h.Cache)
+	}
+	invalidateStoreDesign(h.Cache, claims.UserID) // only THIS store's design
+	if slug, err := h.Svc.CurrentSlugBySeller(r.Context(), claims.UserID); err == nil {
+		h.Revalidate.Notify(slug)
+	}
 	res, err := h.Svc.GetDraftWithMeta(r.Context(), claims.UserID)
 	if err != nil {
 		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "published"})
@@ -206,8 +230,13 @@ func (h *StoreDesignHandler) ChangeName(w http.ResponseWriter, r *http.Request) 
 // PublicStore — GET /api/v1/store/:slug (no auth)
 //
 // The published design is the same for every visitor, so it is shared through
-// the cache. A shop name/URL change, a publish and an admin visibility change
-// all invalidate slugsTag, so a retired URL answers 404 at once.
+// the cache. The address is checked first through the shared slug lookup (a
+// shop name/URL change and an admin visibility change invalidate slugsTag, so
+// a retired URL answers 404 at once). The design itself is cached per store,
+// so a publish only clears that one store.
+//
+// A 200 answer carries Cache-Control and an ETag so Next.js and a CDN can
+// reuse it; a 404 never does.
 func (h *StoreDesignHandler) PublicStore(w http.ResponseWriter, r *http.Request) {
 	slug := chi.URLParam(r, "slug")
 	design, err := h.publicDesign(r.Context(), slug)
@@ -225,7 +254,7 @@ func (h *StoreDesignHandler) PublicStore(w http.ResponseWriter, r *http.Request)
 		h.fail(w, r, apperr.NotFound())
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, designResponse{Design: design})
+	writeCachedJSON(w, r, designResponse{Design: design})
 }
 
 // publicDesign returns the published design for a slug, or nil when unknown.
@@ -251,7 +280,22 @@ func (h *StoreDesignHandler) publicDesign(ctx context.Context, slug string) (map
 	if h.Cache == nil || key == "" {
 		return direct()
 	}
-	d, err := cache.Get(ctx, h.Cache, "storefront", "design:"+key, slugsTag, load)
+	// 1. Resolve the address (shared tag): unknown, retired, unpublished and
+	//    hidden stores stop here with nil, exactly as before.
+	sellerID, err := cachedSellerID(ctx, h.Cache, h.Svc, key)
+	if err != nil {
+		return nil, err
+	}
+	if sellerID == "" {
+		return nil, nil
+	}
+	// 2. The design, cached under this store's own tag. The address is part
+	//    of the key, so a renamed store starts from a fresh entry.
+	ckey, kerr := cache.ScopedKey(sellerID, "design", key)
+	if kerr != nil {
+		return direct() // unusual seller id: skip the cache, never fail
+	}
+	d, err := cache.Get(ctx, h.Cache, "storefront", ckey, storeDesignTag(sellerID), load)
 	switch {
 	case err == nil:
 		return d, nil

@@ -25,6 +25,7 @@ import (
 	"shopbd/backend/internal/payment/sslcommerz"
 	"shopbd/backend/internal/ratelimit"
 	"shopbd/backend/internal/repository/mongorepo"
+	"shopbd/backend/internal/revalidate"
 	"shopbd/backend/internal/service"
 	"shopbd/backend/internal/shipping"
 	"shopbd/backend/internal/storage"
@@ -111,10 +112,11 @@ type Deps struct {
 	Shipping           *shipping.Service            // nil = shipping switched off (needs couriers)
 	ProviderName       func(provider string) string
 	FrontendURL        string
-	SocialGoogle       *oauth.Google   // nil = Continue with Google is off
-	SocialApple        *oauth.Apple    // nil = Continue with Apple is off
-	Storage            *storage.R2     // nil = image uploads switched off (R2 not configured)
-	UploadScanner      uploads.Scanner // nil = no malware scan (images are still re-encoded)
+	Revalidate         *revalidate.Client // nil = Next.js refreshes stores on its own timer only
+	SocialGoogle       *oauth.Google      // nil = Continue with Google is off
+	SocialApple        *oauth.Apple       // nil = Continue with Apple is off
+	Storage            *storage.R2        // nil = image uploads switched off (R2 not configured)
+	UploadScanner      uploads.Scanner    // nil = no malware scan (images are still re-encoded)
 	EnforcePlans       bool
 	DB                 Pinger
 	Mongo              *mongo.Database
@@ -211,8 +213,8 @@ func New(d Deps) http.Handler {
 	orderCreateLimit := authLimit("order-create", limits.CreateOrder)
 	checkoutLimit := authLimit("checkout", limits.Checkout)
 
-	sd := &handler.StoreDesignHandler{Svc: d.StoreDesign, Log: log, Cache: d.Cache}
-	prod := &handler.ProductHandler{Svc: d.Products, StoreDesign: d.StoreDesign, Log: log, Cache: d.Cache}
+	sd := &handler.StoreDesignHandler{Svc: d.StoreDesign, Log: log, Cache: d.Cache, Revalidate: d.Revalidate}
+	prod := &handler.ProductHandler{Svc: d.Products, StoreDesign: d.StoreDesign, Log: log, Cache: d.Cache, Revalidate: d.Revalidate}
 	cat := &handler.CategoryHandler{Svc: d.Categories, StoreDesign: d.StoreDesign, Log: log}
 	order := &handler.OrderHandler{Svc: d.Orders, Analytics: d.Analytics, TrustProxy: cfg.TrustProxy, Log: log, Cache: d.Cache}
 	stats := &handler.StatsHandler{Svc: d.Orders, Log: log}
@@ -335,6 +337,17 @@ func New(d Deps) http.Handler {
 	r.Post(httpx.RefreshCookiePath+"/apple/callback", socialH.AppleCallback)
 
 	reviews := handler.Reviews{DB: d.Mongo, Gateway: d.ReviewGateway, Log: log, Cache: d.Cache}
+	if d.Revalidate != nil && d.StoreDesign != nil {
+		reviews.StoreChanged = func(sellerID string) {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				if slug, err := d.StoreDesign.CurrentSlugBySeller(ctx, sellerID); err == nil {
+					d.Revalidate.Notify(slug)
+				}
+			}()
+		}
+	}
 	if d.Storage != nil {
 		reviews.Photos = d.Storage // review photos go to Cloudflare R2, not MongoDB
 	}
@@ -404,17 +417,25 @@ func New(d Deps) http.Handler {
 			// A renamed shop must disappear under its old name/URL at once,
 			// not when the marketplace snapshot expires.
 			if d.StoreDesign != nil {
-				d.StoreDesign.SetOnIdentityChange(func() {
+				d.StoreDesign.SetOnIdentityChange(func(sellerID, oldSlug, newSlug string) {
 					mk.InvalidateSnapshot()
-					sd.InvalidateIdentity() // old URL must 404 at once
+					sd.InvalidateIdentity(sellerID, oldSlug, newSlug) // old URL must 404 at once
 				})
 			}
 			// Suspending / banning / restoring a seller must show up on the
 			// marketplace at once as well.
 			if d.Admin != nil {
-				d.Admin.SetOnVisibilityChange(func() {
+				d.Admin.SetOnVisibilityChange(func(sellerID string) {
 					mk.InvalidateSnapshot()
-					sd.InvalidateIdentity()
+					// Tell Next too: a suspended store must stop being served
+					// from its cache, a restored one must come back.
+					var slug string
+					if d.StoreDesign != nil {
+						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						slug, _ = d.StoreDesign.CurrentSlugBySeller(ctx, sellerID)
+						cancel()
+					}
+					sd.InvalidateIdentity(sellerID, slug)
 				})
 			}
 			go mk.Warm() // build the snapshot now, not on the first visit

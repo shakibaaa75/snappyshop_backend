@@ -54,7 +54,7 @@ type StoreDesignService struct {
 	repo repository.StoreDesignRepository
 
 	mu               sync.RWMutex
-	onIdentityChange func()
+	onIdentityChange func(sellerID, oldSlug, newSlug string)
 	now              func() time.Time
 	gate             DesignGate // optional: nil means no plan checks
 }
@@ -80,19 +80,20 @@ func NewStoreDesignService(repo repository.StoreDesignRepository) *StoreDesignSe
 
 // SetOnIdentityChange registers a callback that runs after a shop name or URL
 // changed. It is used to drop public caches so the old name/URL disappear at
-// once instead of when the cache expires.
-func (s *StoreDesignService) SetOnIdentityChange(fn func()) {
+// once instead of when the cache expires. It receives the seller and the old
+// and new store addresses, so the frontend cache of both can be cleared.
+func (s *StoreDesignService) SetOnIdentityChange(fn func(sellerID, oldSlug, newSlug string)) {
 	s.mu.Lock()
 	s.onIdentityChange = fn
 	s.mu.Unlock()
 }
 
-func (s *StoreDesignService) identityChanged() {
+func (s *StoreDesignService) identityChanged(sellerID, oldSlug, newSlug string) {
 	s.mu.RLock()
 	fn := s.onIdentityChange
 	s.mu.RUnlock()
 	if fn != nil {
-		fn()
+		fn(sellerID, oldSlug, newSlug)
 	}
 }
 
@@ -483,7 +484,7 @@ func (s *StoreDesignService) ChangeSlug(ctx context.Context, sellerID, newSlug s
 	if err != nil {
 		return nil, identityErr(err)
 	}
-	s.identityChanged()
+	s.identityChanged(sellerID, oldSlug, newSlug)
 
 	updated, err := s.repo.GetBySeller(ctx, sellerID)
 	if err != nil {
@@ -589,7 +590,7 @@ func (s *StoreDesignService) ChangeStoreName(ctx context.Context, sellerID strin
 	if err != nil {
 		return nil, identityErr(err)
 	}
-	s.identityChanged()
+	s.identityChanged(sellerID, oldSlug, newSlug)
 
 	updated, err := s.repo.GetBySeller(ctx, sellerID)
 	if err != nil {
