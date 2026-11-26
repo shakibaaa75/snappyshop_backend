@@ -12,6 +12,11 @@ import (
 var (
 	ErrNotFound       = errors.New("repository: not found")
 	ErrDuplicateEmail = errors.New("repository: duplicate email")
+	// ErrDuplicatePhone means another account already holds this verified phone.
+	ErrDuplicatePhone = errors.New("repository: duplicate verified phone")
+	// ErrEmailChanged means the account's email is no longer the one the caller
+	// started from (changed concurrently). Nothing was written.
+	ErrEmailChanged = errors.New("repository: account email changed concurrently")
 	// ErrProviderLinked means LinkProvider refused: this user already has a
 	// different Google / Apple account linked, or this Google / Apple account
 	// already belongs to another user. Nothing was changed.
@@ -64,6 +69,24 @@ type UserRepository interface {
 	// hash, role or status. It is idempotent for the same subject and returns
 	// ErrProviderLinked rather than replacing a different linked account.
 	LinkProvider(ctx context.Context, userID, provider, subject string) error
+
+	// Personal information (seller Settings > Personal information).
+
+	// ChangeEmail replaces the sign-in email and marks it verified, but only
+	// while the account's email is still oldEmail. It returns
+	// ErrDuplicateEmail if newEmail belongs to another account, ErrNotFound if
+	// the user does not exist and ErrEmailChanged if oldEmail no longer matches.
+	ChangeEmail(ctx context.Context, userID, oldEmail, newEmail string) error
+	// MarkEmailVerified sets emailVerified, but only while the email is still
+	// the one that was verified (ErrEmailChanged otherwise).
+	MarkEmailVerified(ctx context.Context, userID, email string) error
+	// ChangePhone stores the personal phone (01XXXXXXXXX) and whether it was
+	// verified. A verified phone is unique across accounts (ErrDuplicatePhone).
+	ChangePhone(ctx context.Context, userID, phone string, verified bool) error
+	// PhoneInUse reports whether another account holds this verified phone.
+	PhoneInUse(ctx context.Context, phone, exceptUserID string) (bool, error)
+	// SetAvatar stores the personal profile picture URL; "" removes it.
+	SetAvatar(ctx context.Context, userID, url string) error
 }
 
 // UserListFilter is used by admin seller/customer lists.

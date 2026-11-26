@@ -56,6 +56,8 @@ type Limits struct {
 	CourierTest     LimitSpec
 	Ship            LimitSpec
 	Upload          LimitSpec
+	PersonalSend    LimitSpec // seller email / phone change: request a code
+	PersonalConfirm LimitSpec // seller email / phone change: enter a code
 }
 
 func DefaultLimits() Limits {
@@ -74,6 +76,8 @@ func DefaultLimits() Limits {
 		CourierTest:     LimitSpec{Every: 3 * time.Second, Burst: 10},
 		Ship:            LimitSpec{Every: 2 * time.Second, Burst: 10},
 		Upload:          LimitSpec{Every: 1 * time.Second, Burst: 20},
+		PersonalSend:    LimitSpec{Every: 30 * time.Second, Burst: 4},
+		PersonalConfirm: LimitSpec{Every: 3 * time.Second, Burst: 10},
 	}
 }
 
@@ -91,6 +95,7 @@ type Deps struct {
 	RateGuard          *ratelimit.Guard  // shared token buckets (Redis) for auth endpoints; nil = per-process limits only
 	Cache              *cache.Cache      // shared cache (Redis); nil = in-process caching only
 	EmailVerification  *service.EmailVerificationService
+	PersonalInfo       *service.PersonalInfoService // nil = seller Personal information switched off
 	Analytics          *service.AnalyticsService
 	Tracking           *service.TrackingService     // nil = pixel settings switched off
 	CustomDomain       *service.CustomDomainService // nil = custom domains switched off
@@ -543,6 +548,26 @@ func New(d Deps) http.Handler {
 				s.Get("/reviews/settings", reviews.HomeSettings)
 				s.Put("/reviews/settings", reviews.SaveHomeSettings)
 				s.With(orderCreateLimit).Post("/reviews/{id}", reviews.SellerAction)
+			}
+			// Personal information: the owner's private email / phone, kept apart
+			// from the public store contact. Changes need the password again
+			// plus a one-time code sent to the NEW address / number.
+			if d.PersonalInfo != nil {
+				pi := &handler.PersonalInfoHandler{Svc: d.PersonalInfo, Log: log}
+				if d.Storage != nil && d.Mongo != nil { // profile picture needs R2 + the upload records
+					pi.R2, pi.Uploads = d.Storage, uploads.NewStore(d.Mongo)
+				}
+				piSend := authLimit("personal-send", limits.PersonalSend)
+				piConfirm := authLimit("personal-confirm", limits.PersonalConfirm)
+				s.Get("/personal", pi.Get)
+				s.With(piSend).Post("/personal/email/change", pi.RequestEmailChange)
+				s.With(piConfirm).Post("/personal/email/change/confirm", pi.ConfirmEmailChange)
+				s.With(piSend).Post("/personal/email/verify", pi.RequestEmailVerify)
+				s.With(piConfirm).Post("/personal/email/verify/confirm", pi.ConfirmEmailVerify)
+				s.With(piSend).Post("/personal/phone/change", pi.RequestPhoneChange)
+				s.With(piConfirm).Post("/personal/phone/change/confirm", pi.ConfirmPhoneChange)
+				s.With(piConfirm).Put("/personal/avatar", pi.SetAvatar)
+				s.With(piConfirm).Delete("/personal/avatar", pi.RemoveAvatar)
 			}
 			s.Get("/store-design", sd.GetDraft)
 			s.Put("/store-design", sd.SaveDraft)

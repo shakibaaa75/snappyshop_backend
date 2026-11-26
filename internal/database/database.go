@@ -115,6 +115,13 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database, log *slog.Logger) er
 				SetPartialFilterExpression(bson.D{{Key: "googleId", Value: bson.D{{Key: "$type", Value: "string"}}}})},
 			{Keys: bson.D{{Key: "appleId", Value: 1}}, Options: options.Index().SetName("uniq_users_apple_id").SetUnique(true).
 				SetPartialFilterExpression(bson.D{{Key: "appleId", Value: bson.D{{Key: "$type", Value: "string"}}}})},
+			// A VERIFIED personal phone belongs to one account. Partial, so empty
+			// and unverified phones never collide with anything.
+			{Keys: bson.D{{Key: "phone", Value: 1}}, Options: options.Index().SetName("uniq_users_verified_phone").SetUnique(true).
+				SetPartialFilterExpression(bson.D{
+					{Key: "phoneVerified", Value: true},
+					{Key: "phone", Value: bson.D{{Key: "$type", Value: "string"}}},
+				})},
 		}},
 		{RefreshTokensCollection, []mongo.IndexModel{
 			{Keys: bson.D{{Key: "tokenHash", Value: 1}}, Options: options.Index().SetName("uniq_refresh_tokens_hash").SetUnique(true)},

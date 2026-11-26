@@ -28,6 +28,7 @@ import (
 	"shopbd/backend/internal/mailer"
 	"shopbd/backend/internal/models"
 	"shopbd/backend/internal/oauth"
+	"shopbd/backend/internal/otp"
 	"shopbd/backend/internal/password"
 	"shopbd/backend/internal/payment/sslcommerz"
 	"shopbd/backend/internal/repository/mongorepo"
@@ -36,6 +37,7 @@ import (
 	"shopbd/backend/internal/secretbox"
 	"shopbd/backend/internal/service"
 	"shopbd/backend/internal/shipping"
+	"shopbd/backend/internal/sms"
 	"shopbd/backend/internal/storage"
 	"shopbd/backend/internal/uploads"
 )
@@ -394,6 +396,35 @@ func run() error {
 	}
 	defer rt.Close()
 
+	// Seller Settings > Personal information: change / verify email and phone.
+	// Needs Redis (codes, attempt and send limits), SMTP (email) and an SMS
+	// provider (phone). Whatever is missing is logged here and reported to the
+	// frontend as its own 503 code, so nobody waits for a code that cannot arrive.
+	var otpStore otp.Store
+	if rt.OTP != nil {
+		otpStore = otp.NewRedis(rt.OTP, "shopbd:otp:", cfg.RedisOpTimeout)
+	}
+	// No SMS provider is wired in yet. Production refuses to send; development
+	// writes the code to the log. Replace this with your provider's adapter.
+	var smsSender sms.Sender = sms.NotConfigured{}
+	if !cfg.IsProduction() {
+		smsSender = sms.DevLog{Log: log}
+	}
+	personalSvc := service.NewPersonalInfoService(
+		mongorepo.NewUsers(db),
+		password.New(password.DefaultParams),
+		otpStore,
+		sender,
+		smsSender,
+		cfg.JWTSecret,
+	)
+	if cfg.SMTPHost == "" && !cfg.IsProduction() {
+		personalSvc.LogCodesTo(log)
+	}
+	for _, m := range personalSvc.MissingDependencies() {
+		log.Warn("personal information: missing dependency, the matching verified change is unavailable", "missing", m)
+	}
+
 	// Courier integrations. The feature is off until COURIER_ENCRYPTION_KEY and
 	// COURIER_FINGERPRINT_KEY are set; a half-set or invalid setup stops startup,
 	// and production refuses to start without them.
@@ -714,6 +745,7 @@ func run() error {
 			RateGuard:          rt.RateGuard,
 			Cache:              rt.Cache,
 			EmailVerification:  verifySvc,
+			PersonalInfo:       personalSvc,
 			Analytics:          analyticsSvc,
 			Tracking:           trackingSvc,
 			CustomDomain:       customDomainSvc,

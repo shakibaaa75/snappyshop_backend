@@ -23,6 +23,8 @@ type UserDTO struct {
 	Email     string `json:"email"`
 	Role      string `json:"role"`
 	StoreSlug string `json:"storeSlug,omitempty"`
+	// The owner's personal profile picture (Settings > Personal information), "" = none.
+	AvatarURL string `json:"avatarUrl,omitempty"`
 	CreatedAt string `json:"createdAt"`
 	// Sign-in methods on the account ("email", "google", "apple"), so the UI
 	// can offer "add a sign-in method". It only says which exist, no secrets.
@@ -51,6 +53,7 @@ func toUserDTO(u *models.User, storeSlug string) UserDTO {
 		Email:         u.Email,
 		Role:          string(u.Role),
 		StoreSlug:     storeSlug,
+		AvatarURL:     u.AvatarURL,
 		CreatedAt:     u.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }

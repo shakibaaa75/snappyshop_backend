@@ -30,6 +30,7 @@ type Config struct {
 	// never be evicted; cache entries may be). Both default to RedisURL.
 	RedisRateLimitURL string
 	RedisCacheURL     string
+	RedisOTPURL       string // one-time codes (personal-info changes); defaults to REDIS_URL
 	RedisPoolSize     int
 	RedisMinIdle      int
 	RedisDialTimeout  time.Duration
@@ -195,6 +196,7 @@ func (c *Config) loadRedisTuning(get func(key, def string) string, fail func(for
 	}
 	c.RedisRateLimitURL = redisURL("RATELIMIT_REDIS_URL")
 	c.RedisCacheURL = redisURL("CACHE_REDIS_URL")
+	c.RedisOTPURL = redisURL("OTP_REDIS_URL")
 
 	intVal := func(key string, def, min, max int) int {
 		n, err := strconv.Atoi(get(key, strconv.Itoa(def)))

@@ -174,3 +174,27 @@ func TestRedisTuningRejectsBadValues(t *testing.T) {
 		}
 	}
 }
+
+func TestRedisOTPURL(t *testing.T) {
+	// Not set anywhere: empty, so the personal-info feature reports "no Redis".
+	c, err := FromLookup(lookupFrom(validEnv()))
+	if err != nil || c.RedisOTPURL != "" {
+		t.Fatalf("default: url=%q err=%v", c.RedisOTPURL, err)
+	}
+	// REDIS_URL alone is enough.
+	env := validEnv()
+	env["REDIS_URL"] = "redis://localhost:6379/0"
+	if c, err = FromLookup(lookupFrom(env)); err != nil || c.RedisOTPURL != "redis://localhost:6379/0" {
+		t.Fatalf("default from REDIS_URL: url=%q err=%v", c.RedisOTPURL, err)
+	}
+	// OTP_REDIS_URL overrides it.
+	env["OTP_REDIS_URL"] = "rediss://otp.example.com:6380/1"
+	if c, err = FromLookup(lookupFrom(env)); err != nil || c.RedisOTPURL != "rediss://otp.example.com:6380/1" {
+		t.Fatalf("override: url=%q err=%v", c.RedisOTPURL, err)
+	}
+	// A bad scheme is rejected at startup.
+	env["OTP_REDIS_URL"] = "http://nope"
+	if _, err = FromLookup(lookupFrom(env)); err == nil || !strings.Contains(err.Error(), "OTP_REDIS_URL") {
+		t.Fatalf("bad scheme: err=%v", err)
+	}
+}

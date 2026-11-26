@@ -36,6 +36,16 @@ type User struct {
 	Status        Status    `bson:"status" json:"-"`
 	CreatedAt     time.Time `bson:"createdAt" json:"-"`
 	UpdatedAt     time.Time `bson:"updatedAt" json:"-"`
+
+	// Personal contact details, kept apart from anything shown on a public
+	// storefront (store contact numbers, WhatsApp, ...). Phone is stored as
+	// 01XXXXXXXXX; empty means none. A phone is only PhoneVerified after the
+	// owner proved it with a one-time code.
+	Phone         string `bson:"phone,omitempty" json:"-"`
+	PhoneVerified bool   `bson:"phoneVerified" json:"-"`
+	// AvatarURL is the owner's personal profile picture (an R2 image they
+	// uploaded). It is not the store logo.
+	AvatarURL string `bson:"avatarUrl,omitempty" json:"-"`
 }
 
 // Social sign-in providers.

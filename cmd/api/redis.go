@@ -23,6 +23,7 @@ import (
 type redisRuntime struct {
 	RateGuard *ratelimit.Guard // nil when no Redis is configured for rate limiting
 	Cache     *cache.Cache     // never nil; runs in degraded mode without Redis
+	OTP       *redis.Client    // one-time codes; nil when no Redis URL is set (the feature then refuses to run)
 	clients   []*redis.Client
 }
 
@@ -86,6 +87,19 @@ func setupRedis(ctx context.Context, cfg *config.Config, log *slog.Logger) (*red
 	} else if cfg.IsProduction() {
 		log.Warn("no Redis URL set: auth rate limits are per instance only; " +
 			"with N instances an attacker gets N times the limit")
+	}
+
+	// One-time codes (email / phone changes). Uses OTP_REDIS_URL, which defaults
+	// to REDIS_URL. Like rate limits, these must not be evicted early, so a
+	// non-"allkeys-*" eviction policy (or a separate instance) is advisable.
+	if cfg.RedisOTPURL != "" {
+		c, err := open("otp", cfg.RedisOTPURL)
+		if err != nil {
+			return nil, err
+		}
+		rt.OTP = c
+	} else {
+		log.Warn("no Redis URL set (REDIS_URL / OTP_REDIS_URL): seller email and phone changes cannot send verification codes")
 	}
 
 	// Cache.

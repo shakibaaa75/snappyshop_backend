@@ -174,6 +174,117 @@ func (r *Users) UpdateProfile(ctx context.Context, userID, name, email string) e
 	return nil
 }
 
+// ChangeEmail swaps the sign-in email for a new, already-verified one. The
+// filter includes the old email, so two overlapping changes cannot both win
+// and a change made from a stale page cannot overwrite a newer one.
+func (r *Users) ChangeEmail(ctx context.Context, userID, oldEmail, newEmail string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	res, err := r.col.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: userID}, {Key: "email", Value: oldEmail}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "email", Value: newEmail},
+			{Key: "emailVerified", Value: true},
+			{Key: "updatedAt", Value: time.Now().UTC()},
+		}}},
+	)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) { // unique index on email
+			return repository.ErrDuplicateEmail
+		}
+		return err
+	}
+	if res.MatchedCount == 0 {
+		if _, ferr := r.FindByID(ctx, userID); ferr != nil {
+			return ferr // ErrNotFound
+		}
+		return repository.ErrEmailChanged
+	}
+	return nil
+}
+
+func (r *Users) MarkEmailVerified(ctx context.Context, userID, email string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	res, err := r.col.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: userID}, {Key: "email", Value: email}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "emailVerified", Value: true},
+			{Key: "updatedAt", Value: time.Now().UTC()},
+		}}},
+	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		if _, ferr := r.FindByID(ctx, userID); ferr != nil {
+			return ferr
+		}
+		return repository.ErrEmailChanged
+	}
+	return nil
+}
+
+// ChangePhone stores the personal phone. The partial unique index
+// (uniq_users_verified_phone) makes a verified phone belong to one account.
+func (r *Users) ChangePhone(ctx context.Context, userID, phone string, verified bool) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	set := bson.D{
+		{Key: "phone", Value: phone},
+		{Key: "phoneVerified", Value: verified},
+		{Key: "updatedAt", Value: time.Now().UTC()},
+	}
+	res, err := r.col.UpdateOne(ctx, bson.D{{Key: "_id", Value: userID}}, bson.D{{Key: "$set", Value: set}})
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return repository.ErrDuplicatePhone
+		}
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
+func (r *Users) PhoneInUse(ctx context.Context, phone, exceptUserID string) (bool, error) {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	n, err := r.col.CountDocuments(ctx, bson.D{
+		{Key: "phone", Value: phone},
+		{Key: "phoneVerified", Value: true},
+		{Key: "_id", Value: bson.D{{Key: "$ne", Value: exceptUserID}}},
+	}, options.Count().SetLimit(1))
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (r *Users) SetAvatar(ctx context.Context, userID, url string) error {
+	ctx, cancel := withTimeout(ctx)
+	defer cancel()
+	update := bson.D{{Key: "$set", Value: bson.D{
+		{Key: "avatarUrl", Value: url},
+		{Key: "updatedAt", Value: time.Now().UTC()},
+	}}}
+	if url == "" {
+		update = bson.D{
+			{Key: "$unset", Value: bson.D{{Key: "avatarUrl", Value: ""}}},
+			{Key: "$set", Value: bson.D{{Key: "updatedAt", Value: time.Now().UTC()}}},
+		}
+	}
+	res, err := r.col.UpdateOne(ctx, bson.D{{Key: "_id", Value: userID}}, update)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return repository.ErrNotFound
+	}
+	return nil
+}
+
 func (r *Users) CountByRole(ctx context.Context, role models.Role) (int64, error) {
 	ctx, cancel := withTimeout(ctx)
 	defer cancel()

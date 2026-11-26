@@ -299,3 +299,79 @@ func (r *Users) UpdateRole(_ context.Context, userID string, role models.Role) e
 	u.Role = role
 	return nil
 }
+
+// ChangeEmail mirrors the Mongo version: it only applies while the email is
+// still oldEmail and refuses an address another account holds.
+func (r *Users) ChangeEmail(_ context.Context, userID, oldEmail, newEmail string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.byID[userID]
+	if !ok {
+		return repository.ErrNotFound
+	}
+	if u.Email != oldEmail {
+		return repository.ErrEmailChanged
+	}
+	if other, taken := r.byEmail[newEmail]; taken && other != userID {
+		return repository.ErrDuplicateEmail
+	}
+	delete(r.byEmail, u.Email)
+	u.Email = newEmail
+	u.EmailVerified = true
+	r.byEmail[newEmail] = userID
+	return nil
+}
+
+func (r *Users) MarkEmailVerified(_ context.Context, userID, email string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.byID[userID]
+	if !ok {
+		return repository.ErrNotFound
+	}
+	if u.Email != email {
+		return repository.ErrEmailChanged
+	}
+	u.EmailVerified = true
+	return nil
+}
+
+func (r *Users) ChangePhone(_ context.Context, userID, phone string, verified bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.byID[userID]
+	if !ok {
+		return repository.ErrNotFound
+	}
+	if verified {
+		for _, o := range r.byID {
+			if o.ID != userID && o.Phone == phone && o.PhoneVerified {
+				return repository.ErrDuplicatePhone
+			}
+		}
+	}
+	u.Phone, u.PhoneVerified = phone, verified
+	return nil
+}
+
+func (r *Users) PhoneInUse(_ context.Context, phone, exceptUserID string) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, o := range r.byID {
+		if o.ID != exceptUserID && o.Phone == phone && o.PhoneVerified {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (r *Users) SetAvatar(_ context.Context, userID, url string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.byID[userID]
+	if !ok {
+		return repository.ErrNotFound
+	}
+	u.AvatarURL = url
+	return nil
+}

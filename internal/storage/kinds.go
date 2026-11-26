@@ -37,9 +37,12 @@ var Kinds = map[string]Kind{
 	"category":       {Folder: "catagory_image", Types: imageTypes, MaxBytes: 3 * mb},
 	"seller_cover":   {Folder: "seller_cover", Types: imageTypes, MaxBytes: 5 * mb},
 	"seller_profile": {Folder: "seller_profile", Types: imageTypes, MaxBytes: 2 * mb},
-	"homepage":       {Folder: "server_homepage", Types: imageTypes, MaxBytes: 5 * mb},
-	"look_model":     {Folder: "try_the_look", Types: imageTypes, MaxBytes: 5 * mb},
-	"banner_video":   {Folder: "banner_video", Types: videoTypes, MaxBytes: 50 * mb},
+	// The owner's personal profile picture (Settings > Personal information).
+	// Its own folder: "seller_profile" is the storefront image.
+	"avatar":       {Folder: "seller_avatar", Types: imageTypes, MaxBytes: 2 * mb},
+	"homepage":     {Folder: "server_homepage", Types: imageTypes, MaxBytes: 5 * mb},
+	"look_model":   {Folder: "try_the_look", Types: imageTypes, MaxBytes: 5 * mb},
+	"banner_video": {Folder: "banner_video", Types: videoTypes, MaxBytes: 50 * mb},
 }
 
 // ReviewPhotos is where buyers' review photos are stored. It is not in Kinds on

@@ -31,6 +31,18 @@ type Noop struct{}
 
 func (Noop) Send(context.Context, string, string, string, string) error { return nil }
 
+// Configured reports whether m can really deliver email. NewSender returns
+// Noop (which silently drops every message and reports success) when SMTP is
+// not set up; features that depend on the email actually arriving must check
+// this first instead of trusting a nil error from Send.
+func Configured(m Mailer) bool {
+	if m == nil {
+		return false
+	}
+	_, noop := m.(Noop)
+	return !noop
+}
+
 type smtpSender struct {
 	cfg Config
 }
